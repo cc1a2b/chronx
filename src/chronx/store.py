@@ -12,7 +12,7 @@ import os
 import tempfile
 import zlib
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 try:
     from blake3 import blake3 as _hasher
@@ -84,12 +84,42 @@ class ObjectStore:
             raise ValueError(f"corrupt object {digest}: {exc}") from exc
 
     def count(self) -> int:
-        n = 0
+        return sum(1 for _ in self.iter_blobs())
+
+    def iter_blobs(self) -> "Iterator[tuple[str, Path, int]]":
+        """Yield (digest, path, stored_size) for every blob on disk."""
         try:
-            for shard in os.scandir(self.root):
-                if shard.is_dir(follow_symlinks=False):
-                    with os.scandir(shard.path) as it:
-                        n += sum(1 for e in it if e.name[:1] != ".")
+            shards = sorted(os.scandir(self.root), key=lambda e: e.name)
         except FileNotFoundError:
-            pass
-        return n
+            return
+        for shard in shards:
+            if not shard.is_dir(follow_symlinks=False) or len(shard.name) != 2:
+                continue
+            with os.scandir(shard.path) as it:
+                for entry in it:
+                    if entry.name[:1] == "." or not entry.is_file(follow_symlinks=False):
+                        continue
+                    yield (
+                        shard.name + entry.name,
+                        Path(entry.path),
+                        entry.stat().st_size,
+                    )
+
+    def disk_usage(self) -> tuple[int, int]:
+        """(blob count, total stored bytes)."""
+        n = total = 0
+        for _digest, _path, size in self.iter_blobs():
+            n += 1
+            total += size
+        return n, total
+
+    def delete(self, digest: str) -> int:
+        """Remove a blob; return the bytes freed (0 if it wasn't there)."""
+        path = self._path(digest)
+        try:
+            size = path.stat().st_size
+            path.chmod(0o600)  # blobs are stored read-only
+            path.unlink()
+            return size
+        except OSError:
+            return 0

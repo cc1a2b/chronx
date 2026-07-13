@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat as statmod
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -299,9 +300,7 @@ def apply_undo(
         applied.append(step.rel)
 
     # 3. Record the revert as an event of its own (this is the redo handle).
-    import time as _time
-
-    now = _time.time()
+    now = time.time()
     backup_event_id = dbm.record_event(
         conn,
         session=UNDO_SESSION,
@@ -332,3 +331,225 @@ def find_undo_target(conn: sqlite3.Connection, cwd: Path) -> sqlite3.Row:
             + (f" under {root['path']}" if root is not None else "")
         )
     return row
+
+
+# ------------------------------------------------------------ cat / restore
+
+
+@dataclass(frozen=True)
+class HistoricContent:
+    """A file's recorded state at some moment."""
+
+    root: Path
+    root_id: int
+    rel: str
+    digest: str | None  # None = the file did not exist at that moment
+    mode: int | None
+    size: int | None
+    source: str  # human description of where this state comes from
+
+
+def _resolve_tracked(conn: sqlite3.Connection, file: Path) -> tuple[sqlite3.Row, str]:
+    resolved = file.resolve()
+    root = dbm.root_for_path(conn, resolved)
+    if root is None:
+        raise OpsError(f"{file} is not inside any tracked directory")
+    rel = os.path.relpath(resolved, root["path"]).replace(os.sep, "/")
+    return root, rel
+
+
+def content_at(
+    conn: sqlite3.Connection,
+    file: Path,
+    *,
+    at: float | None = None,
+    event_id: int | None = None,
+    before: bool = False,
+) -> HistoricContent:
+    """The recorded state of `file` after (or before) an event or moment.
+
+    Selector: `event_id` pins one event; otherwise `at` (default now) picks
+    the last event touching the file at/before that time. `before=True`
+    returns the state just before the selected event instead of after it.
+    """
+    root, rel = _resolve_tracked(conn, file)
+    root_id = int(root["id"])
+    root_path = Path(root["path"])
+
+    row = dbm.last_delta_for_path(conn, root_id, rel, at=at, event_id=event_id)
+    if row is not None:
+        digest = row["before_hash"] if before else row["after_hash"]
+        mode = row["before_mode"] if before else row["after_mode"]
+        size = row["before_size"] if before else row["after_size"]
+        side = "before" if before else "after"
+        cmd = row["command"] if row["command"] is not None else "(external change)"
+        return HistoricContent(
+            root=root_path, root_id=root_id, rel=rel, digest=digest,
+            mode=mode, size=size,
+            source=f"{side} event #{row['event_id']} ($ {cmd})",
+        )
+
+    if event_id is not None:
+        raise OpsError(f"event #{event_id} did not touch {rel}")
+    entry = dbm.manifest_entry(conn, root_id, rel)
+    if entry is None:
+        raise OpsError(
+            f"no recorded content for {rel} (never snapshotted — "
+            "ignored, oversized, or created before tracking began)"
+        )
+    return HistoricContent(
+        root=root_path, root_id=root_id, rel=rel, digest=entry.hash,
+        mode=entry.mode, size=entry.size,
+        source="baseline snapshot (file unchanged since tracking began)",
+    )
+
+
+def restore_file(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    target: HistoricContent,
+) -> tuple[int, str]:
+    """Write a historic state back to disk, with the same safety net as undo:
+    current content is snapshotted first and the restore is recorded as its
+    own event. Returns (backup_event_id, action description)."""
+    full = target.root / target.rel
+    data, st = _current_state(full)
+    cur_hash = hash_bytes(data) if data is not None else None
+    cur_size = len(data) if data is not None else None
+    cur_mode = st.st_mode if st is not None else None
+
+    if cur_hash == target.digest:
+        raise OpsError(f"{target.rel} already matches that state; nothing to do")
+    if data is not None:
+        store.put_bytes(data)  # safety snapshot of what we're replacing
+
+    manifest_updates: dict[str, dbm.ManifestEntry] = {}
+    manifest_deletes: set[str] = set()
+    if target.digest is None:
+        if data is None and st is None:
+            raise OpsError(f"{target.rel} already absent; nothing to do")
+        try:
+            full.unlink(missing_ok=True)
+        except OSError as exc:
+            raise OpsError(f"could not remove {target.rel}: {exc}") from exc
+        change, after_hash, after_size, after_mode = "D", None, None, None
+        action = "deleted (file did not exist at that moment)"
+        manifest_deletes.add(target.rel)
+    else:
+        if not store.has(target.digest):
+            raise OpsError(f"blob for {target.rel} is missing from the object store")
+        blob = store.get(target.digest)
+        try:
+            _write_atomic(full, blob, target.mode)
+        except OSError as exc:
+            raise OpsError(f"could not write {target.rel}: {exc}") from exc
+        new_st = os.lstat(full)
+        change = "M" if cur_hash is not None else "A"
+        after_hash, after_size, after_mode = target.digest, len(blob), new_st.st_mode
+        action = f"restored to {target.source}"
+        manifest_updates[target.rel] = dbm.ManifestEntry(
+            hash=target.digest, size=len(blob),
+            mtime=new_st.st_mtime, mode=new_st.st_mode,
+        )
+
+    now = time.time()
+    backup_event_id = dbm.record_event(
+        conn,
+        session=UNDO_SESSION,
+        root_id=target.root_id,
+        cwd=str(target.root),
+        command=f"chronx restore {target.rel} ({target.source})",
+        started_at=now,
+        finished_at=now,
+        exit_code=0,
+        deltas=[
+            dbm.Delta(
+                target.rel, change, cur_hash, after_hash,
+                cur_size, after_size, cur_mode, after_mode,
+            )
+        ],
+        manifest_updates=manifest_updates,
+        manifest_deletes=manifest_deletes,
+    )
+    send_line(paths.fifo, encode_sync(str(target.root)))
+    return backup_event_id, action
+
+
+# ------------------------------------------------------------------ gc
+
+
+@dataclass(frozen=True)
+class PruneStats:
+    events_deleted: int
+    deltas_deleted: int
+    blobs_deleted: int
+    bytes_freed: int
+    blobs_kept: int
+
+
+def prune(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    *,
+    keep_days: float,
+    dry_run: bool,
+) -> PruneStats:
+    """Delete events older than keep_days, then any blob no longer referenced
+    by a remaining delta or manifest. The daemon must be stopped (the caller
+    enforces this): it caches manifests and dedups against the object store.
+    """
+    cutoff = time.time() - keep_days * 86400.0
+    events = conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE started_at < ?", (cutoff,)
+    ).fetchone()["n"]
+    deltas = conn.execute(
+        "SELECT COUNT(*) AS n FROM deltas WHERE event_id IN"
+        " (SELECT id FROM events WHERE started_at < ?)",
+        (cutoff,),
+    ).fetchone()["n"]
+
+    if not dry_run and events:
+        with conn:
+            conn.execute(
+                "DELETE FROM deltas WHERE event_id IN"
+                " (SELECT id FROM events WHERE started_at < ?)",
+                (cutoff,),
+            )
+            conn.execute("DELETE FROM events WHERE started_at < ?", (cutoff,))
+
+    # Referenced set AFTER the deletion above (or as it would be, on dry runs).
+    if dry_run:
+        refs = set()
+        for column in ("before_hash", "after_hash"):
+            refs.update(
+                r[0]
+                for r in conn.execute(
+                    f"SELECT DISTINCT {column} FROM deltas WHERE {column} IS NOT NULL"
+                    " AND event_id IN (SELECT id FROM events WHERE started_at >= ?)",
+                    (cutoff,),
+                )
+            )
+        refs.update(r[0] for r in conn.execute("SELECT DISTINCT hash FROM manifest"))
+    else:
+        refs = dbm.referenced_hashes(conn)
+
+    blobs_deleted = bytes_freed = blobs_kept = 0
+    for digest, _path, size in store.iter_blobs():
+        if digest in refs:
+            blobs_kept += 1
+            continue
+        blobs_deleted += 1
+        bytes_freed += size
+        if not dry_run:
+            store.delete(digest)
+
+    if not dry_run:
+        conn.execute("VACUUM")
+    return PruneStats(
+        events_deleted=events,
+        deltas_deleted=deltas,
+        blobs_deleted=blobs_deleted,
+        bytes_freed=bytes_freed,
+        blobs_kept=blobs_kept,
+    )

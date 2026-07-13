@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chronx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Time-travel debugger for shell sessions: records the causal link between commands and the filesystem changes they produce."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,4 +42,4 @@ chronx = "chronx.cli:main"
 packages = ["src/chronx"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/chronx", "README.md", "pyproject.toml"]
+include = ["src/chronx", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]

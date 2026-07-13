@@ -54,6 +54,7 @@ class ReplayApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("c", "toggle_changes", "Changes only"),
         Binding("j", "cursor_down", "Older/newer", show=False),
         Binding("k", "cursor_up", show=False),
         Binding("g", "go_start", "Oldest", show=False),
@@ -65,6 +66,9 @@ class ReplayApp(App[None]):
         self._paths = paths
         self._limit = limit
         self._all_roots = all_roots
+        self._changes_only = False
+        self._row_ids: list[int] = []
+        self._last_max_id = -1
         self._conn: sqlite3.Connection | None = None
         self._store = ObjectStore(paths.objects)
 
@@ -84,6 +88,15 @@ class ReplayApp(App[None]):
         table.add_columns("#", "time", "Δ", "exit", "command")
         self._load_events()
         table.focus()
+        self.set_interval(2.0, self._poll)
+
+    def _poll(self) -> None:
+        """Follow the session live: reload when new events land."""
+        if self._conn is None:
+            return
+        current = dbm.max_event_id(self._conn)
+        if current != self._last_max_id:
+            self._load_events(keep_cursor=True)
 
     def on_unmount(self) -> None:
         if self._conn is not None:
@@ -98,12 +111,24 @@ class ReplayApp(App[None]):
         root = dbm.root_for_path(self._conn, Path.cwd())
         return int(root["id"]) if root is not None else None
 
-    def _load_events(self) -> None:
+    def _load_events(self, keep_cursor: bool = False) -> None:
         assert self._conn is not None
         table = self.query_one("#timeline", DataTable)
+        prev_id: int | None = None
+        was_at_end = True
+        if keep_cursor and self._row_ids:
+            idx = table.cursor_row
+            if 0 <= idx < len(self._row_ids):
+                prev_id = self._row_ids[idx]
+                was_at_end = idx == len(self._row_ids) - 1
         table.clear()
+        self._row_ids = []
+        self._last_max_id = dbm.max_event_id(self._conn)
         rows = dbm.recent_events(
-            self._conn, root_id=self._scope_root_id(), limit=self._limit
+            self._conn,
+            root_id=self._scope_root_id(),
+            limit=self._limit,
+            changes_only=self._changes_only,
         )
         if not rows:
             self._set_detail(
@@ -113,8 +138,10 @@ class ReplayApp(App[None]):
                     "and your shell sources the hook (`chronx init`).",
                     style="dim",
                 )
+                if not self._changes_only
+                else Text("No file-changing events (press c to show all).", style="dim")
             )
-            self.sub_title = "0 events"
+            self.sub_title = "0 events" + (" [changes only]" if self._changes_only else "")
             return
 
         ids = [int(r["id"]) for r in rows]
@@ -145,8 +172,14 @@ class ReplayApp(App[None]):
                 ),
                 key=str(event_id),
             )
-        self.sub_title = f"{len(rows)} events (latest {self._limit})"
-        table.move_cursor(row=table.row_count - 1)
+            self._row_ids.append(event_id)
+        self.sub_title = f"{len(rows)} events (latest {self._limit})" + (
+            " [changes only]" if self._changes_only else ""
+        )
+        if prev_id is not None and not was_at_end and prev_id in self._row_ids:
+            table.move_cursor(row=self._row_ids.index(prev_id))
+        else:
+            table.move_cursor(row=table.row_count - 1)
 
     # ------------------------------------------------------------------ view
 
@@ -198,6 +231,10 @@ class ReplayApp(App[None]):
     # --------------------------------------------------------------- actions
 
     def action_refresh(self) -> None:
+        self._load_events()
+
+    def action_toggle_changes(self) -> None:
+        self._changes_only = not self._changes_only
         self._load_events()
 
     def action_cursor_down(self) -> None:

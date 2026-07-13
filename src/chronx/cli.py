@@ -19,13 +19,34 @@ from .ops import (
     OpsError,
     apply_undo,
     blame_file,
+    content_at,
     describe_command,
     find_undo_target,
     plan_undo,
+    prune,
     resolve_event,
+    restore_file,
 )
 from .store import HASH_ALGO, ObjectStore
-from .when import fmt_ts
+from .when import WhenParseError, fmt_ts, parse_when
+
+
+def _human_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+def _parse_at(at: str | None) -> float | None:
+    if at is None:
+        return None
+    try:
+        return parse_when(at)
+    except WhenParseError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 SHELLS = ("bash", "zsh")
 
@@ -183,9 +204,10 @@ def status() -> None:
     try:
         events = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
         roots = dbm.get_roots(conn)
+        blobs, stored = ObjectStore(paths.objects).disk_usage()
         click.echo(f"store:  {paths.home}")
         click.echo(f"  events:  {events}")
-        click.echo(f"  objects: {ObjectStore(paths.objects).count()}")
+        click.echo(f"  objects: {blobs} ({_human_bytes(stored)} compressed)")
         click.echo(f"  roots:   {len(roots)}")
         for r in roots:
             click.echo(f"    {r['path']}")
@@ -354,6 +376,183 @@ def undo(event_id: int | None, yes: bool, force: bool) -> None:
         )
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------- log
+
+
+@main.command("log")
+@click.option("--limit", "-n", default=30, show_default=True,
+              help="How many recent events to show.")
+@click.option("--all-roots", is_flag=True,
+              help="Every tracked directory, not just the current one.")
+@click.option("--changes-only", "-c", is_flag=True,
+              help="Hide commands that changed no files.")
+def log_cmd(limit: int, all_roots: bool, changes_only: bool) -> None:
+    """Print the recent event timeline (newest last), like a quick git log."""
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        root_id = None
+        if not all_roots:
+            root = dbm.root_for_path(conn, Path.cwd())
+            root_id = int(root["id"]) if root is not None else None
+        rows = dbm.recent_events(
+            conn, root_id=root_id, limit=limit, changes_only=changes_only
+        )
+        if not rows:
+            click.echo("no events recorded" + ("" if all_roots else " for this directory"))
+            return
+        for r in rows:
+            counts = dbm.delta_counts(conn, int(r["id"]))
+            total = sum(counts.values())
+            delta_s = (
+                click.style(f"±{total:<3}", fg="magenta", bold=True)
+                if total
+                else click.style("·   ", dim=True)
+            )
+            exit_code = r["exit_code"]
+            exit_s = (
+                click.style(" - ", dim=True)
+                if exit_code is None
+                else click.style(f"{exit_code:>3}", fg="green" if exit_code == 0 else "red")
+            )
+            cmd = describe_command(r)
+            cmd = cmd if len(cmd) <= 100 else cmd[:97] + "..."
+            cmd_s = click.style(cmd, fg="yellow" if r["command"] else None,
+                                dim=r["command"] is None)
+            click.echo(
+                f"#{r['id']:<5} {fmt_ts(r['started_at'])}  {delta_s} {exit_s}  {cmd_s}"
+            )
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------- cat
+
+
+@main.command()
+@click.argument("file", type=click.Path(path_type=Path))
+@click.option("--at", "-t", default=None,
+              help="Moment to read at ('10m', '14:32', ISO...). Default: latest snapshot.")
+@click.option("--event", "-e", "event_id", type=int, default=None,
+              help="Read the state at a specific event instead of a time.")
+@click.option("--before", is_flag=True,
+              help="State just BEFORE the selected event, not after it.")
+def cat(file: Path, at: str | None, event_id: int | None, before: bool) -> None:
+    """Print FILE's recorded content at a moment in time (to stdout)."""
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+    try:
+        try:
+            state = content_at(
+                conn, file, at=_parse_at(at), event_id=event_id, before=before
+            )
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if state.digest is None:
+            raise click.ClickException(
+                f"{state.rel} did not exist {state.source}"
+            )
+        try:
+            data = store.get(state.digest)
+        except (KeyError, ValueError) as exc:
+            raise click.ClickException(f"blob unavailable: {exc}") from exc
+        click.echo(f"# {state.rel} — {state.source}", err=True)
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------- restore
+
+
+@main.command()
+@click.argument("file", type=click.Path(path_type=Path))
+@click.option("--at", "-t", default=None,
+              help="Moment to restore to ('10m', '14:32', ISO...).")
+@click.option("--event", "-e", "event_id", type=int, default=None,
+              help="Restore the state at a specific event.")
+@click.option("--before", is_flag=True,
+              help="State just BEFORE the selected event (undo that event for this file).")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def restore(
+    file: Path, at: str | None, event_id: int | None, before: bool, yes: bool
+) -> None:
+    """Restore a single FILE to its state at a moment in time.
+
+    Typical flow: `chronx blame FILE` to find the event that broke it, then
+    `chronx restore FILE -e <id> --before`. Like undo, the current content
+    is snapshotted first, so a restore is always reversible.
+    """
+    paths = _paths()
+    conn = _open_db(paths, readonly=False)
+    store = ObjectStore(paths.objects)
+    try:
+        try:
+            state = content_at(
+                conn, file, at=_parse_at(at), event_id=event_id, before=before
+            )
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        click.secho(f"restore {state.rel}", bold=True)
+        click.echo(f"  to:   {state.source}")
+        if state.digest is None:
+            click.secho("  the file did not exist then — it will be DELETED", fg="red")
+        else:
+            click.echo(f"  size: {state.size} bytes, blob {state.digest[:12]}")
+        if not yes and not click.confirm("Proceed?", default=False):
+            click.echo("aborted")
+            return
+        try:
+            backup_id, action = restore_file(conn, store, paths, state)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"{state.rel}: {action}", fg="green")
+        click.secho(
+            f"recorded as event #{backup_id} (restore it to go back)", dim=True
+        )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------- gc
+
+
+@main.command()
+@click.option("--keep-days", default=30.0, show_default=True, type=float,
+              help="Keep events newer than this many days.")
+@click.option("--dry-run", is_flag=True, help="Report what would be freed, change nothing.")
+def gc(keep_days: float, dry_run: bool) -> None:
+    """Prune old events and delete blobs nothing references anymore.
+
+    The daemon must be stopped first (it caches manifests and dedups
+    against the object store).
+    """
+    paths = _paths()
+    pid = daemonmod.daemon_pid(paths)
+    if pid is not None and not dry_run:
+        raise click.ClickException(
+            f"daemon is running (pid {pid}) — stop it first: chronx daemon stop"
+        )
+    conn = _open_db(paths, readonly=dry_run)
+    try:
+        stats = prune(
+            conn, ObjectStore(paths.objects), keep_days=keep_days, dry_run=dry_run
+        )
+    finally:
+        conn.close()
+    verb = "would delete" if dry_run else "deleted"
+    click.echo(
+        f"{verb} {stats.events_deleted} event(s), {stats.deltas_deleted} delta row(s), "
+        f"{stats.blobs_deleted} blob(s) ({_human_bytes(stats.bytes_freed)})"
+    )
+    click.echo(f"kept {stats.blobs_kept} referenced blob(s)")
+    if dry_run:
+        click.secho("dry run: nothing was changed", dim=True)
 
 
 # ------------------------------------------------------------------ replay

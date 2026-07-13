@@ -225,7 +225,12 @@ class Daemon:
             # Lost the POST for the previous command (shell killed, write
             # dropped); finalize it now so its dirt isn't misattributed.
             self._finalize(stale, PostMsg(msg.session, time.time(), None))
-        if not any(p.root_id == rs.root_id for p in self.pending.values()):
+        root_busy = any(
+            p.root_id == rs.root_id for p in self.pending.values()
+        ) or any(p.root_id == rs.root_id for _, _, p, _ in self._finalize_q)
+        if not root_busy:
+            # No command window is (or was just) open on this root, so any
+            # dirt is ambient: editor saves, cron, other tools.
             self._record_external(rs, candidates=self._claim_dirty(rs.path, None))
         self.pending[msg.session] = Pending(
             session=msg.session,

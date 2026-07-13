@@ -314,19 +314,89 @@ def event_at(
 
 
 def recent_events(
-    conn: sqlite3.Connection, *, root_id: int | None = None, limit: int = 500
+    conn: sqlite3.Connection,
+    *,
+    root_id: int | None = None,
+    limit: int = 500,
+    changes_only: bool = False,
 ) -> list[sqlite3.Row]:
     """Most recent events, returned oldest-first (timeline order)."""
-    scope = "" if root_id is None else " WHERE root_id = ?"
-    params: list[object] = ([root_id] if root_id is not None else []) + [limit]
+    where: list[str] = []
+    params: list[object] = []
+    if root_id is not None:
+        where.append("root_id = ?")
+        params.append(root_id)
+    if changes_only:
+        where.append("EXISTS (SELECT 1 FROM deltas d WHERE d.event_id = events.id)")
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    params.append(limit)
     rows = list(
         conn.execute(
-            f"SELECT * FROM events{scope} ORDER BY id DESC LIMIT ?",
+            f"SELECT * FROM events{clause} ORDER BY id DESC LIMIT ?",
             params,
         )
     )
     rows.reverse()
     return rows
+
+
+def max_event_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()
+    return int(row["m"])
+
+
+def manifest_entry(
+    conn: sqlite3.Connection, root_id: int, path: str
+) -> ManifestEntry | None:
+    row = conn.execute(
+        "SELECT * FROM manifest WHERE root_id = ? AND path = ?", (root_id, path)
+    ).fetchone()
+    if row is None:
+        return None
+    return ManifestEntry(
+        hash=row["hash"], size=row["size"], mtime=row["mtime"], mode=row["mode"]
+    )
+
+
+def last_delta_for_path(
+    conn: sqlite3.Connection,
+    root_id: int,
+    rel_path: str,
+    *,
+    at: float | None = None,
+    event_id: int | None = None,
+) -> sqlite3.Row | None:
+    """The most recent delta touching rel_path (optionally at/before a time,
+    or within one specific event)."""
+    sql = (
+        "SELECT d.*, e.id AS event_id, e.started_at AS started_at,"
+        " e.command AS command"
+        " FROM deltas d JOIN events e ON e.id = d.event_id"
+        " WHERE e.root_id = ? AND d.path = ?"
+    )
+    params: list[object] = [root_id, rel_path]
+    if event_id is not None:
+        sql += " AND e.id = ?"
+        params.append(event_id)
+    if at is not None:
+        sql += " AND e.started_at <= ?"
+        params.append(at)
+    sql += " ORDER BY e.id DESC LIMIT 1"
+    return conn.execute(sql, params).fetchone()
+
+
+def referenced_hashes(conn: sqlite3.Connection) -> set[str]:
+    """Every blob digest still reachable from deltas or manifests."""
+    refs: set[str] = set()
+    for column in ("before_hash", "after_hash"):
+        refs.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT {column} FROM deltas WHERE {column} IS NOT NULL"
+            )
+        )
+    refs.update(r[0] for r in conn.execute("SELECT DISTINCT hash FROM manifest"))
+    return refs
 
 
 def events_touching(

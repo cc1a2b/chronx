@@ -59,10 +59,22 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx init` | Set up `~/.chronx` and print the shell-hook instructions. |
 | `chronx hook bash\|zsh` | Print the raw hook script (what `init` tells you to eval). |
 | `chronx daemon start\|stop\|status` | Manage the background watcher. |
-| `chronx replay` | Interactive TUI timeline — scrub through your session with arrow keys. |
+| `chronx replay` | Interactive TUI timeline — scrub with arrow keys; auto-follows the live session; `c` hides no-change commands. |
+| `chronx log` | Quick plain-text timeline (`-n 50`, `--changes-only`, `--all-roots`). |
 | `chronx diff <time>` | Show the filesystem changes at that moment (`last`, an event id, `10m`, `14:32`, an ISO date...). |
 | `chronx blame <file>` | Which commands touched this file, and when. |
+| `chronx cat <file>` | Print the file's recorded content at any moment (`--at 10m`, `--event 42 --before`). |
+| `chronx restore <file>` | Put a single file back to its state at any moment (reversible, confirmed). |
 | `chronx undo` | Revert the working dir to its state before the last command. |
+| `chronx gc` | Prune events older than `--keep-days` (default 30) and unreferenced blobs; `--dry-run` previews. |
+
+### Single-file time travel
+
+`chronx blame src/config.py` tells you event `#42` clobbered the file;
+`chronx restore src/config.py -e 42 --before` puts back the content from just
+before that command ran. `chronx cat` is the read-only version — pipe an old
+state anywhere without touching the working tree. Both accept `--at '14:32'`
+style moments too.
 
 ### `chronx undo` safety
 
