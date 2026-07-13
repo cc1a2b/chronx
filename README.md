@@ -40,6 +40,9 @@ pipx install chronx
 
    # ~/.zshrc
    eval "$(chronx hook zsh)"
+
+   # ~/.config/fish/config.fish
+   chronx hook fish | source
    ```
 
 3. Start the recorder:
@@ -66,7 +69,33 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx cat <file>` | Print the file's recorded content at any moment (`--at 10m`, `--event 42 --before`). |
 | `chronx restore <file>` | Put a single file back to its state at any moment (reversible, confirmed). |
 | `chronx undo` | Revert the working dir to its state before the last command. |
+| `chronx rollback <moment>` | Revert the **whole tree** to a mark, time, or event — one reversible event. |
+| `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
+| `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
+| `chronx stats` | Hottest files, noisiest commands, store size. |
+| `chronx fsck` | Verify blob integrity and that all referenced history is present. |
 | `chronx gc` | Prune events older than `--keep-days` (default 30) and unreferenced blobs; `--dry-run` previews. |
+
+### Marks & full rollback
+
+```sh
+chronx mark before-upgrade         # checkpoint this moment
+./upgrade.sh && make migrate       # ... things go sideways ...
+chronx rollback before-upgrade     # entire tree back to the checkpoint
+```
+
+Rollback reconstructs the tree state at that moment from history (files
+changed since are restored, files created since are deleted, files deleted
+since come back) and applies it as **one recorded event** — so `chronx undo`
+reverts the rollback itself. `--path src/` limits the blast radius,
+`--dry-run` shows the plan.
+
+### Finding the culprit
+
+```sh
+chronx search 'pip install'        # grep your command history + effects
+chronx search -S 'timeout *= *30'  # pickaxe: which command changed this line?
+```
 
 ### Single-file time travel
 
@@ -140,6 +169,11 @@ last one.
 
 `.git`, `node_modules`, `__pycache__`, virtualenvs, build dirs, editor swap
 files, etc. are ignored by default. Set `CHRONX_HOME` to relocate the store.
+
+Per-project rules go in `<root>/.chronxignore` (read when the daemon starts
+tracking that directory): one pattern per line, `#` comments; lines ending in
+`/` prune directories by name anywhere in the tree, anything else is a glob
+matched against file basenames.
 
 ## Limitations
 

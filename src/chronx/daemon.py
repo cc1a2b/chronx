@@ -33,7 +33,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from . import db as dbm
-from .config import Config, Paths
+from .config import Config, Paths, load_root_ignore
 from .ipc import PostMsg, PreMsg, SyncMsg, parse_line
 from .snapshot import compute_deltas, is_ignored_rel, scan_root
 from .store import ObjectStore
@@ -61,6 +61,7 @@ class RootState:
     root_id: int
     path: Path
     manifest: dict[str, dbm.ManifestEntry]
+    cfg: Config  # global config + this root's .chronxignore
 
 
 class _DirtyHandler(FileSystemEventHandler):
@@ -154,10 +155,11 @@ class Daemon:
             self.refused_roots.add(key)
             return None
 
+        root_cfg = self.cfg.with_extra(*load_root_ignore(p))
         root_id, created = dbm.ensure_root(self.conn, key)
         if created:
             log.info("baseline scan of new root %s", key)
-            manifest = scan_root(p, self.store, self.cfg)
+            manifest = scan_root(p, self.store, root_cfg)
             if manifest is None:
                 log.warning(
                     "refusing to track %s: more than %d files", key, self.cfg.max_files
@@ -169,11 +171,11 @@ class Daemon:
             log.info("baseline complete: %d files", len(manifest))
         else:
             manifest = dbm.load_manifest(self.conn, root_id)
-            rs_tmp = RootState(root_id=root_id, path=p, manifest=manifest)
+            rs_tmp = RootState(root_id=root_id, path=p, manifest=manifest, cfg=root_cfg)
             self._record_external(rs_tmp, candidates=None)  # offline catch-up
             manifest = rs_tmp.manifest
 
-        rs = RootState(root_id=root_id, path=p, manifest=manifest)
+        rs = RootState(root_id=root_id, path=p, manifest=manifest, cfg=root_cfg)
         self.roots[key] = rs
         self.observer.schedule(self._handler, key, recursive=True)
         log.info("watching %s (root %d, %d files)", key, root_id, len(rs.manifest))
@@ -184,7 +186,7 @@ class Daemon:
     def _record_external(self, rs: RootState, candidates: set[str] | None) -> None:
         """Fold ambient (non-command) changes into an '(external)' event."""
         deltas, updates, deletes = compute_deltas(
-            rs.path, candidates, rs.manifest, self.store, self.cfg
+            rs.path, candidates, rs.manifest, self.store, rs.cfg
         )
         if not deltas and not updates and not deletes:
             return
@@ -268,7 +270,7 @@ class Daemon:
             return
         candidates = self._claim_dirty(rs.path, pending.started_mono - 0.05)
         deltas, updates, deletes = compute_deltas(
-            rs.path, candidates, rs.manifest, self.store, self.cfg
+            rs.path, candidates, rs.manifest, self.store, rs.cfg
         )
         rs.manifest.update(updates)
         for rel in deletes:

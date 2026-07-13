@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 ENV_HOME = "CHRONX_HOME"
@@ -124,6 +124,18 @@ class Config:
     def settle_seconds(self) -> float:
         return max(self.settle_ms, 0) / 1000.0
 
+    def with_extra(
+        self, dirs: frozenset[str], globs: tuple[str, ...]
+    ) -> "Config":
+        """A copy of this config with additional ignore rules merged in."""
+        if not dirs and not globs:
+            return self
+        return replace(
+            self,
+            ignore_dirs=self.ignore_dirs | dirs,
+            ignore_globs=self.ignore_globs + globs,
+        )
+
     @classmethod
     def load(cls, paths: Paths) -> "Config":
         try:
@@ -142,3 +154,27 @@ class Config:
             ignore_globs=DEFAULT_IGNORE_GLOBS
             + tuple(str(g) for g in raw.get("extra_ignore_globs", [])),
         )
+
+
+def load_root_ignore(root: Path) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Parse `<root>/.chronxignore` into (dir names, basename globs).
+
+    One pattern per line; `#` starts a comment. Lines ending with `/` name
+    directories to prune anywhere in the tree; anything else is a glob
+    matched against file basenames.
+    """
+    dirs: set[str] = set()
+    globs: list[str] = []
+    try:
+        text = (root / ".chronxignore").read_text(encoding="utf-8")
+    except OSError:
+        return frozenset(), ()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("/"):
+            dirs.add(line.rstrip("/").strip())
+        else:
+            globs.append(line)
+    return frozenset(d for d in dirs if d), tuple(globs)

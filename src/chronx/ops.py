@@ -14,6 +14,7 @@ from . import db as dbm
 from .config import Paths
 from .ipc import encode_sync, send_line
 from .store import ObjectStore, hash_bytes
+from .when import fmt_ts
 
 UNDO_SESSION = "chronx"
 
@@ -53,10 +54,14 @@ def resolve_event(
             raise OpsError(f"no event with id {stripped}")
         return row
 
-    try:
-        ts = parse_when(spec)
-    except WhenParseError as exc:
-        raise OpsError(str(exc)) from exc
+    mark = dbm.get_mark(conn, spec)
+    if mark is not None:
+        ts = float(mark["ts"])
+    else:
+        try:
+            ts = parse_when(spec)
+        except WhenParseError as exc:
+            raise OpsError(str(exc)) from exc
     row = dbm.event_at(conn, ts, root_id=root_id)
     if row is None and root_id is not None:
         row = dbm.event_at(conn, ts)
@@ -474,6 +479,178 @@ def restore_file(
     )
     send_line(paths.fifo, encode_sync(str(target.root)))
     return backup_event_id, action
+
+
+# ------------------------------------------------------------------ rollback
+
+
+@dataclass(frozen=True)
+class RollbackStep:
+    rel: str
+    action: str  # 'restore', 'delete', 'create'
+    target_hash: str | None  # None = file did not exist at that moment
+    target_mode: int | None
+    target_size: int | None
+    current_hash: str | None
+    current_size: int | None
+    current_mode: int | None
+    blocked: str | None = None  # reason this step cannot be applied
+
+
+@dataclass(frozen=True)
+class RollbackPlan:
+    root: Path
+    root_id: int
+    ts: float
+    label: str  # human description of the target moment
+    steps: list[RollbackStep]
+
+    @property
+    def applicable(self) -> list[RollbackStep]:
+        return [s for s in self.steps if s.blocked is None]
+
+    @property
+    def blocked(self) -> list[RollbackStep]:
+        return [s for s in self.steps if s.blocked is not None]
+
+
+def plan_rollback(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    cwd: Path,
+    ts: float,
+    label: str,
+    *,
+    path_prefix: str | None = None,
+) -> RollbackPlan:
+    """Reconstruct the tree state at `ts` and plan the writes to get back there.
+
+    For every path some event touched after `ts`, the earliest such delta's
+    before-side IS the state at `ts` — restore that. Untouched paths are
+    already at their `ts` state and never appear in the plan.
+    """
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root = Path(root_row["path"])
+    root_id = int(root_row["id"])
+    if ts < float(root_row["added_at"]):
+        raise OpsError(
+            f"{fmt_ts(ts)} is before chronx started tracking {root} "
+            f"({fmt_ts(root_row['added_at'])}); nothing recorded that far back"
+        )
+
+    prefix = path_prefix.strip("/") if path_prefix else None
+    steps: list[RollbackStep] = []
+    for rel in dbm.paths_changed_since(conn, root_id, ts, path_prefix=prefix):
+        first = dbm.first_delta_after(conn, root_id, rel, ts)
+        if first is None:  # raced away; shouldn't happen
+            continue
+        target_hash = first["before_hash"]
+        target_mode = first["before_mode"]
+        target_size = first["before_size"]
+
+        full = root / rel
+        data, st = _current_state(full)
+        cur_hash = hash_bytes(data) if data is not None else None
+        cur_size = len(data) if data is not None else None
+        cur_mode = st.st_mode if st is not None else None
+
+        if cur_hash == target_hash and (target_hash is not None or st is None):
+            continue  # changed after ts, but changed back — already correct
+
+        blocked: str | None = None
+        if target_hash is not None and not store.has(target_hash):
+            blocked = "blob missing from object store (pruned by gc?)"
+        if target_hash is None:
+            action = "delete"
+        elif cur_hash is None and st is None:
+            action = "create"
+        else:
+            action = "restore"
+        steps.append(
+            RollbackStep(
+                rel=rel, action=action,
+                target_hash=target_hash, target_mode=target_mode,
+                target_size=target_size,
+                current_hash=cur_hash, current_size=cur_size, current_mode=cur_mode,
+                blocked=blocked,
+            )
+        )
+    return RollbackPlan(root=root, root_id=root_id, ts=ts, label=label, steps=steps)
+
+
+def apply_rollback(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    plan: RollbackPlan,
+) -> tuple[int, int]:
+    """Execute a rollback plan (applicable steps only) as ONE recorded event,
+    so the whole rollback can itself be reverted with a single undo.
+    Returns (backup_event_id, files_changed)."""
+    steps = plan.applicable
+    if not steps:
+        raise OpsError("nothing to apply (already at that state, or all steps blocked)")
+
+    for step in steps:  # safety snapshots before touching anything
+        data, _ = _current_state(plan.root / step.rel)
+        if data is not None:
+            store.put_bytes(data)
+
+    deltas: list[dbm.Delta] = []
+    manifest_updates: dict[str, dbm.ManifestEntry] = {}
+    manifest_deletes: set[str] = set()
+    for step in steps:
+        full = plan.root / step.rel
+        if step.target_hash is None:
+            try:
+                full.unlink(missing_ok=True)
+            except OSError as exc:
+                raise OpsError(f"could not remove {step.rel}: {exc}") from exc
+            if step.current_hash is not None:
+                deltas.append(
+                    dbm.Delta(
+                        step.rel, "D", step.current_hash, None,
+                        step.current_size, None, step.current_mode, None,
+                    )
+                )
+            manifest_deletes.add(step.rel)
+        else:
+            blob = store.get(step.target_hash)
+            try:
+                _write_atomic(full, blob, step.target_mode)
+            except OSError as exc:
+                raise OpsError(f"could not restore {step.rel}: {exc}") from exc
+            st = os.lstat(full)
+            change = "M" if step.current_hash is not None else "A"
+            deltas.append(
+                dbm.Delta(
+                    step.rel, change, step.current_hash, step.target_hash,
+                    step.current_size, len(blob), step.current_mode, st.st_mode,
+                )
+            )
+            manifest_updates[step.rel] = dbm.ManifestEntry(
+                hash=step.target_hash, size=len(blob),
+                mtime=st.st_mtime, mode=st.st_mode,
+            )
+
+    now = time.time()
+    event_id = dbm.record_event(
+        conn,
+        session=UNDO_SESSION,
+        root_id=plan.root_id,
+        cwd=str(plan.root),
+        command=f"chronx rollback to {plan.label}",
+        started_at=now,
+        finished_at=now,
+        exit_code=0,
+        deltas=deltas,
+        manifest_updates=manifest_updates,
+        manifest_deletes=manifest_deletes,
+    )
+    send_line(paths.fifo, encode_sync(str(plan.root)))
+    return event_id, len(deltas)
 
 
 # ------------------------------------------------------------------ gc

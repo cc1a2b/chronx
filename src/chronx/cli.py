@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.resources
 import os
+import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -17,17 +19,19 @@ from .config import DEFAULT_CONFIG_TOML, Config, Paths
 from .diffview import render_delta, stat_line
 from .ops import (
     OpsError,
+    apply_rollback,
     apply_undo,
     blame_file,
     content_at,
     describe_command,
     find_undo_target,
+    plan_rollback,
     plan_undo,
     prune,
     resolve_event,
     restore_file,
 )
-from .store import HASH_ALGO, ObjectStore
+from .store import HASH_ALGO, ObjectStore, hash_bytes
 from .when import WhenParseError, fmt_ts, parse_when
 
 
@@ -48,7 +52,14 @@ def _parse_at(at: str | None) -> float | None:
     except WhenParseError as exc:
         raise click.ClickException(str(exc)) from exc
 
-SHELLS = ("bash", "zsh")
+SHELLS = ("bash", "zsh", "fish")
+_RC_FILES = {"bash": "~/.bashrc", "zsh": "~/.zshrc", "fish": "~/.config/fish/config.fish"}
+
+
+def _hook_line(shell: str) -> str:
+    if shell == "fish":
+        return "chronx hook fish | source"
+    return f'eval "$(chronx hook {shell})"'
 
 
 def _paths() -> Paths:
@@ -126,10 +137,9 @@ def init() -> None:
     click.echo("Add the hook to your shell rc file (once), then restart the shell:")
     click.echo()
     for s in ordered:
-        rc = "~/.bashrc" if s == "bash" else "~/.zshrc"
         marker = "  <- your shell" if s == shell else ""
-        click.secho(f'  # {rc}{marker}', dim=True)
-        click.echo(f'  eval "$(chronx hook {s})"')
+        click.secho(f"  # {_RC_FILES[s]}{marker}", dim=True)
+        click.echo(f"  {_hook_line(s)}")
         click.echo()
     click.echo("Then start the recorder:")
     click.echo()
@@ -139,7 +149,7 @@ def init() -> None:
 @main.command()
 @click.argument("shell", type=click.Choice(SHELLS))
 def hook(shell: str) -> None:
-    """Print the shell hook script for SHELL (bash or zsh)."""
+    """Print the shell hook script for SHELL (bash, zsh, or fish)."""
     script = (
         importlib.resources.files("chronx") / "hooks" / f"chronx.{shell}"
     ).read_text(encoding="utf-8")
@@ -234,8 +244,8 @@ def run() -> None:
 def diff(time: str, stat: bool) -> None:
     """Show the filesystem changes at TIME.
 
-    TIME is an event id (from blame/replay), 'last', or a moment like
-    '10m', '14:32', or '2026-07-13T14:32'.
+    TIME is an event id (from blame/replay), 'last', a mark name, or a
+    moment like '10m', '14:32', or '2026-07-13T14:32'.
     """
     paths = _paths()
     conn = _open_db(paths)
@@ -553,6 +563,346 @@ def gc(keep_days: float, dry_run: bool) -> None:
     click.echo(f"kept {stats.blobs_kept} referenced blob(s)")
     if dry_run:
         click.secho("dry run: nothing was changed", dim=True)
+
+
+# ------------------------------------------------------------- mark / marks
+
+_MARK_NAME = re.compile(r"^[A-Za-z][\w.-]*$")
+
+
+@main.command()
+@click.argument("name")
+@click.option("--at", "-t", default=None,
+              help="Moment to mark ('10m', '14:32'...). Default: now.")
+@click.option("--delete", "-d", "delete_", is_flag=True, help="Delete the mark instead.")
+def mark(name: str, at: str | None, delete_: bool) -> None:
+    """Name the current moment so you can diff/rollback to it later.
+
+    `chronx mark before-refactor` ... hack hack hack ...
+    `chronx rollback before-refactor` puts everything back.
+    """
+    paths = _paths()
+    conn = _open_db(paths, readonly=False)
+    try:
+        if delete_:
+            if dbm.delete_mark(conn, name):
+                click.secho(f"mark {name!r} deleted", fg="green")
+            else:
+                raise click.ClickException(f"no mark named {name!r}")
+            return
+        if not _MARK_NAME.match(name) or name in ("last", "now"):
+            raise click.ClickException(
+                "mark names must start with a letter and use only letters, "
+                "digits, '.', '-', '_' (and not be 'last'/'now')"
+            )
+        ts = _parse_at(at) if at is not None else time.time()
+        root = dbm.root_for_path(conn, Path.cwd())
+        try:
+            dbm.add_mark(conn, name, ts, int(root["id"]) if root else None)
+        except sqlite3.IntegrityError:
+            raise click.ClickException(
+                f"mark {name!r} already exists (delete it with `chronx mark -d {name}`)"
+            ) from None
+        click.secho(f"marked {fmt_ts(ts)} as {name!r}", fg="green")
+        click.secho(f"  chronx diff {name}   /   chronx rollback {name}", dim=True)
+    finally:
+        conn.close()
+
+
+@main.command()
+def marks() -> None:
+    """List named marks."""
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        rows = dbm.list_marks(conn)
+        if not rows:
+            click.echo("no marks (create one with `chronx mark <name>`)")
+            return
+        for r in rows:
+            click.echo(f"  {r['name']:<24} {fmt_ts(r['ts'])}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- rollback
+
+
+@main.command()
+@click.argument("moment")
+@click.option("--path", "path_prefix", default=None,
+              help="Only roll back files under this prefix (relative to the root).")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.option("--dry-run", is_flag=True, help="Show the plan and stop.")
+def rollback(moment: str, path_prefix: str | None, yes: bool, dry_run: bool) -> None:
+    """Revert the whole working directory to its state at MOMENT.
+
+    MOMENT is a mark name, a time ('10m', '14:32', ISO...), or an event id
+    (meaning: the state just after that event). Untouched files are left
+    alone; everything is applied as ONE recorded event, so a rollback is
+    itself reversible with `chronx undo`.
+    """
+    paths = _paths()
+    conn = _open_db(paths, readonly=dry_run)
+    store = ObjectStore(paths.objects)
+    try:
+        mark_row = dbm.get_mark(conn, moment)
+        if mark_row is not None:
+            ts = float(mark_row["ts"])
+            label = f"mark {moment!r} ({fmt_ts(ts)})"
+        elif moment.lstrip("#").isdigit() and float(moment.lstrip("#")) < 1e9:
+            event = dbm.event_by_id(conn, int(moment.lstrip("#")))
+            if event is None:
+                raise click.ClickException(f"no event with id {moment}")
+            ts = float(event["started_at"])
+            label = f"after event #{event['id']} ({fmt_ts(ts)})"
+        else:
+            ts = _parse_at(moment) or time.time()
+            label = fmt_ts(ts)
+
+        try:
+            plan = plan_rollback(conn, store, Path.cwd(), ts, label,
+                                 path_prefix=path_prefix)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        if not plan.steps:
+            click.secho(f"already at the state of {label}; nothing to do", fg="green")
+            return
+        click.secho(f"rolling back {plan.root} to {label}:", bold=True)
+        shown = 0
+        for step in plan.steps:
+            if shown >= 40:
+                click.secho(f"  ... and {len(plan.steps) - shown} more", dim=True)
+                break
+            shown += 1
+            verb = {"restore": "restore", "delete": "delete ", "create": "recreate"}[
+                step.action
+            ]
+            line = f"  {verb} {step.rel}"
+            if step.blocked:
+                click.secho(f"{line}   [SKIPPED: {step.blocked}]", fg="red")
+            else:
+                click.echo(line)
+        if plan.blocked:
+            click.secho(
+                f"{len(plan.blocked)} file(s) cannot be rolled back and will be "
+                "skipped (see above)",
+                fg="yellow",
+            )
+        if dry_run:
+            click.secho("dry run: nothing was changed", dim=True)
+            return
+        if not yes and not click.confirm(
+            f"Roll back {len(plan.applicable)} file(s)?", default=False
+        ):
+            click.echo("aborted")
+            return
+        try:
+            event_id, changed = apply_rollback(conn, store, paths, plan)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"rolled back {changed} file(s) to {label}", fg="green")
+        click.secho(
+            f"recorded as event #{event_id}; `chronx undo --event {event_id}` "
+            "reverts the rollback",
+            dim=True,
+        )
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ search
+
+
+@main.command()
+@click.argument("pattern")
+@click.option("--content", "-S", is_flag=True,
+              help="Pickaxe: search lines ADDED or REMOVED by commands (regex).")
+@click.option("--limit", "-n", default=50, show_default=True,
+              help="Max results (or, with -S, max file-changing events scanned).")
+@click.option("--all-roots", is_flag=True,
+              help="Search every tracked directory, not just the current one.")
+def search(pattern: str, content: bool, limit: int, all_roots: bool) -> None:
+    """Find commands by name, or find WHICH command touched a line (-S).
+
+    `chronx search 'npm install'` greps command strings.
+    `chronx search -S 'DEBUG *= *True'` finds the events whose file changes
+    added or removed lines matching the regex — "when did this line change?"
+    """
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+    try:
+        root_id = None
+        if not all_roots:
+            root = dbm.root_for_path(conn, Path.cwd())
+            root_id = int(root["id"]) if root is not None else None
+
+        if not content:
+            rows = dbm.search_commands(conn, pattern, root_id=root_id, limit=limit)
+            if not rows:
+                click.echo("no matching commands")
+                return
+            for r in reversed(rows):
+                counts = dbm.delta_counts(conn, int(r["id"]))
+                total = sum(counts.values())
+                click.echo(
+                    f"#{r['id']:<5} {fmt_ts(r['started_at'])}  "
+                    f"{'±' + str(total) if total else '·':<4}  "
+                    + click.style(describe_command(r), fg="yellow")
+                )
+            return
+
+        try:
+            rx = re.compile(pattern)
+        except re.error as exc:
+            raise click.ClickException(f"bad regex: {exc}") from exc
+        events = dbm.recent_events(
+            conn, root_id=root_id, limit=limit, changes_only=True
+        )
+        hits = 0
+        for event in reversed(events):  # newest first
+            matched: list[tuple[str, list[str]]] = []
+            for d in dbm.deltas_for(conn, int(event["id"])):
+                lines = [
+                    line
+                    for line in render_delta(store, d, max_lines=2000)
+                    if line[:1] in "+-"
+                    and not line.startswith(("+++", "---"))
+                    and rx.search(line[1:])
+                ]
+                if lines:
+                    matched.append((d.path, lines[:5]))
+            if not matched:
+                continue
+            hits += 1
+            click.secho(
+                f"#{event['id']}  {fmt_ts(event['started_at'])}  "
+                f"$ {describe_command(event)}",
+                bold=True,
+            )
+            for path, lines in matched:
+                click.echo(f"  {path}:")
+                for line in lines:
+                    _echo_diff_line("    " + line)
+            click.echo()
+        if not hits:
+            click.echo(
+                f"no added/removed lines match /{pattern}/ in the last "
+                f"{len(events)} file-changing event(s); raise -n to scan further back"
+            )
+    finally:
+        conn.close()
+
+
+# -------------------------------------------------------------------- fsck
+
+
+@main.command()
+def fsck() -> None:
+    """Verify store integrity: every blob decompresses and re-hashes to its
+    name, and every hash the event log references actually exists on disk."""
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+    try:
+        refs = dbm.referenced_hashes(conn)
+    finally:
+        conn.close()
+
+    present: set[str] = set()
+    corrupt: list[str] = []
+    checked = 0
+    for digest, _path, _size in store.iter_blobs():
+        present.add(digest)
+        checked += 1
+        try:
+            if hash_bytes(store.get(digest)) != digest:
+                corrupt.append(digest)
+        except (KeyError, ValueError):
+            corrupt.append(digest)
+    missing = sorted(refs - present)
+    orphans = len(present - refs)
+
+    click.echo(f"checked {checked} blob(s): {len(corrupt)} corrupt")
+    for d in corrupt[:10]:
+        click.secho(f"  corrupt: {d}", fg="red")
+    click.echo(f"referenced hashes: {len(refs)}, missing from disk: {len(missing)}")
+    for d in missing[:10]:
+        click.secho(f"  missing: {d[:16]}... (history for it cannot be shown/restored)",
+                    fg="red")
+    click.echo(f"unreferenced blobs: {orphans} (reclaim with `chronx gc`)")
+    if corrupt or missing:
+        raise click.exceptions.Exit(1)
+    click.secho("store is healthy", fg="green")
+
+
+# ------------------------------------------------------------------- stats
+
+
+@main.command()
+@click.option("--all-roots", is_flag=True,
+              help="Aggregate every tracked directory, not just the current one.")
+@click.option("--top", default=10, show_default=True, help="Rows per leaderboard.")
+def stats(all_roots: bool, top: int) -> None:
+    """Where does your churn actually go? Hot files and noisy commands."""
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        scope = ""
+        params: list[object] = []
+        if not all_roots:
+            root = dbm.root_for_path(conn, Path.cwd())
+            if root is not None:
+                scope = " AND e.root_id = ?"
+                params = [int(root["id"])]
+        totals = conn.execute(
+            f"SELECT COUNT(*) AS n, SUM(command IS NULL) AS ext,"
+            f" SUM(exit_code IS NOT NULL AND exit_code != 0) AS failed,"
+            f" MIN(started_at) AS first, MAX(started_at) AS last"
+            f" FROM events e WHERE 1=1{scope}",
+            params,
+        ).fetchone()
+        if not totals["n"]:
+            click.echo("no events recorded" + ("" if all_roots else " for this directory"))
+            return
+        changing = conn.execute(
+            f"SELECT COUNT(DISTINCT e.id) AS n FROM events e"
+            f" JOIN deltas d ON d.event_id = e.id WHERE 1=1{scope}",
+            params,
+        ).fetchone()["n"]
+        click.secho("events", bold=True)
+        click.echo(
+            f"  {totals['n']} total, {changing} changed files, "
+            f"{totals['ext'] or 0} external, {totals['failed'] or 0} failed"
+        )
+        click.echo(f"  from {fmt_ts(totals['first'])} to {fmt_ts(totals['last'])}")
+
+        click.secho("\nhottest files (by number of changes)", bold=True)
+        for r in conn.execute(
+            f"SELECT d.path, COUNT(*) AS n FROM deltas d"
+            f" JOIN events e ON e.id = d.event_id WHERE 1=1{scope}"
+            f" GROUP BY d.path ORDER BY n DESC, d.path LIMIT ?",
+            params + [top],
+        ):
+            click.echo(f"  {r['n']:>4}  {r['path']}")
+
+        click.secho("\nnoisiest commands (by files changed)", bold=True)
+        for r in conn.execute(
+            f"SELECT e.command AS command, COUNT(*) AS n FROM deltas d"
+            f" JOIN events e ON e.id = d.event_id WHERE e.command IS NOT NULL{scope}"
+            f" GROUP BY e.command ORDER BY n DESC LIMIT ?",
+            params + [top],
+        ):
+            cmd = r["command"] if len(r["command"]) <= 80 else r["command"][:77] + "..."
+            click.echo(f"  {r['n']:>4}  {click.style(cmd, fg='yellow')}")
+
+        blobs, stored = ObjectStore(paths.objects).disk_usage()
+        click.secho("\nstore", bold=True)
+        click.echo(f"  {blobs} unique blob(s), {_human_bytes(stored)} compressed")
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ replay

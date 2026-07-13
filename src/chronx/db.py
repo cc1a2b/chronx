@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS manifest (
     mode    INTEGER NOT NULL,
     PRIMARY KEY (root_id, path)
 );
+CREATE TABLE IF NOT EXISTS marks (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    ts         REAL NOT NULL,
+    root_id    INTEGER REFERENCES roots(id),
+    created_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_events_root_time ON events(root_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_deltas_event ON deltas(event_id);
 CREATE INDEX IF NOT EXISTS idx_deltas_path ON deltas(path);
@@ -383,6 +390,100 @@ def last_delta_for_path(
         params.append(at)
     sql += " ORDER BY e.id DESC LIMIT 1"
     return conn.execute(sql, params).fetchone()
+
+
+# --- marks ------------------------------------------------------------------
+
+
+def add_mark(
+    conn: sqlite3.Connection, name: str, ts: float, root_id: int | None
+) -> None:
+    """Create a named point in time. Raises sqlite3.IntegrityError on dupes."""
+    with conn:
+        conn.execute(
+            "INSERT INTO marks (name, ts, root_id, created_at) VALUES (?, ?, ?, ?)",
+            (name, ts, root_id, time.time()),
+        )
+
+
+def get_mark(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    try:
+        return conn.execute("SELECT * FROM marks WHERE name = ?", (name,)).fetchone()
+    except sqlite3.OperationalError:  # pre-marks store opened read-only
+        return None
+
+
+def list_marks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    try:
+        return list(conn.execute("SELECT * FROM marks ORDER BY ts"))
+    except sqlite3.OperationalError:
+        return []
+
+
+def delete_mark(conn: sqlite3.Connection, name: str) -> bool:
+    with conn:
+        cur = conn.execute("DELETE FROM marks WHERE name = ?", (name,))
+    return cur.rowcount > 0
+
+
+# --- rollback ----------------------------------------------------------------
+
+
+def paths_changed_since(
+    conn: sqlite3.Connection,
+    root_id: int,
+    ts: float,
+    *,
+    path_prefix: str | None = None,
+) -> list[str]:
+    """Every path touched by an event after `ts` (they may differ from state@ts)."""
+    sql = (
+        "SELECT DISTINCT d.path FROM deltas d JOIN events e ON e.id = d.event_id"
+        " WHERE e.root_id = ? AND e.started_at > ?"
+    )
+    params: list[object] = [root_id, ts]
+    if path_prefix:
+        sql += " AND (d.path = ? OR d.path LIKE ? ESCAPE '\\')"
+        params += [path_prefix, _like_escape(path_prefix) + "/%"]
+    return [r["path"] for r in conn.execute(sql + " ORDER BY d.path", params)]
+
+
+def first_delta_after(
+    conn: sqlite3.Connection, root_id: int, path: str, ts: float
+) -> sqlite3.Row | None:
+    """The earliest delta touching `path` after `ts`; its before_* fields are
+    exactly the file's state at `ts`."""
+    return conn.execute(
+        "SELECT d.* FROM deltas d JOIN events e ON e.id = d.event_id"
+        " WHERE e.root_id = ? AND d.path = ? AND e.started_at > ?"
+        " ORDER BY e.id ASC LIMIT 1",
+        (root_id, path, ts),
+    ).fetchone()
+
+
+# --- search ------------------------------------------------------------------
+
+
+def _like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_commands(
+    conn: sqlite3.Connection,
+    needle: str,
+    *,
+    root_id: int | None = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Events whose command contains `needle` (case-insensitive), newest first."""
+    sql = "SELECT * FROM events WHERE command LIKE ? ESCAPE '\\'"
+    params: list[object] = [f"%{_like_escape(needle)}%"]
+    if root_id is not None:
+        sql += " AND root_id = ?"
+        params.append(root_id)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    return list(conn.execute(sql, params))
 
 
 def referenced_hashes(conn: sqlite3.Connection) -> set[str]:
