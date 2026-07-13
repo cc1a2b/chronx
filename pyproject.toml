@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chronx"
+version = "0.1.0"
+description = "Time-travel debugger for shell sessions: records the causal link between commands and the filesystem changes they produce."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "chronx authors" }]
+keywords = ["shell", "history", "debugger", "snapshot", "undo", "timeline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Shells",
+]
+dependencies = [
+    "click>=8.1",
+    "watchdog>=4.0",
+    "blake3>=0.4",
+    "textual>=0.80",
+]
+
+[project.urls]
+Homepage = "https://github.com/cc1a2b/chronx"
+Repository = "https://github.com/cc1a2b/chronx.git"
+
+[project.scripts]
+chronx = "chronx.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chronx"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/chronx", "README.md", "pyproject.toml"]
