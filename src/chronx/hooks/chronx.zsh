@@ -30,6 +30,12 @@ __chronx_send() {
 
 __chronx_b64() { printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'; }
 
+# Opt-in autostart (chronx daemon autostart on): bring the daemon up once
+# per new shell, silently and in the background.
+if [[ -f "$CHRONX_HOME/autostart" ]] && ! __chronx_alive; then
+    (command chronx daemon start >/dev/null 2>&1 &) 2>/dev/null
+fi
+
 __chronx_ran=
 
 __chronx_preexec() {

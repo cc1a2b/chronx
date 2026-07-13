@@ -22,6 +22,12 @@ if status is-interactive; and not set -q __CHRONX_HOOKED
         printf '%s' $argv[1] | base64 2>/dev/null | tr -d \n
     end
 
+    # Opt-in autostart (chronx daemon autostart on).
+    if test -f $CHRONX_HOME/autostart; and not __chronx_alive
+        command chronx daemon start >/dev/null 2>&1 &
+        disown 2>/dev/null
+    end
+
     function __chronx_send
         __chronx_alive; or return 0
         set -l line (string join \t -- $argv)

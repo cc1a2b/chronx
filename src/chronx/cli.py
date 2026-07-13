@@ -237,6 +237,61 @@ def run() -> None:
         raise click.ClickException(str(exc)) from exc
 
 
+@daemon.command()
+@click.argument("state", type=click.Choice(["on", "off"]), required=False)
+def autostart(state: str | None) -> None:
+    """Have instrumented shells start the daemon automatically.
+
+    When on, each new hooked shell silently runs `chronx daemon start`
+    in the background if no daemon is up."""
+    paths = _paths()
+    flag = paths.home / "autostart"
+    if state is None:
+        click.echo(f"autostart is {'on' if flag.exists() else 'off'}")
+        return
+    if state == "on":
+        paths.ensure()
+        flag.touch()
+        click.secho("autostart on — new shells will bring the daemon up", fg="green")
+    else:
+        flag.unlink(missing_ok=True)
+        click.secho("autostart off", fg="green")
+
+
+# ------------------------------------------------------------------- watch
+
+
+@main.command()
+@click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def watch(path: Path) -> None:
+    """Start tracking PATH right now (baseline + watch), without waiting
+    for a command to run there."""
+    from .ipc import encode_watch, send_line
+    from .ops import _wait_for_root_attach
+
+    paths = _paths()
+    resolved = path.resolve()
+    if not send_line(paths.fifo, encode_watch(str(resolved))):
+        raise click.ClickException(
+            "the chronx daemon is not running (`chronx daemon start`)"
+        )
+    _wait_for_root_attach(paths, resolved, timeout=30.0)
+    conn = _open_db(paths)
+    try:
+        root = dbm.root_for_path(conn, resolved)
+        if root is None:
+            raise click.ClickException(
+                f"daemon did not attach {resolved} — it may exceed max_files "
+                f"or be refused; check {paths.log}"
+            )
+        files = conn.execute(
+            "SELECT COUNT(*) AS n FROM manifest WHERE root_id = ?", (root["id"],)
+        ).fetchone()["n"]
+        click.secho(f"watching {root['path']} ({files} file(s) in baseline)", fg="green")
+    finally:
+        conn.close()
+
+
 # -------------------------------------------------------------------- diff
 
 

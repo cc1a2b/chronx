@@ -41,7 +41,12 @@ class SyncMsg:
     root: str
 
 
-Message = PreMsg | PostMsg | SyncMsg
+@dataclass(frozen=True)
+class WatchMsg:
+    root: str
+
+
+Message = PreMsg | PostMsg | SyncMsg | WatchMsg
 
 
 def _b64decode(field: str) -> str | None:
@@ -82,6 +87,11 @@ def parse_line(line: str) -> Message | None:
         if not root:
             return None
         return SyncMsg(root=root)
+    if kind == "WATCH" and len(parts) >= 2:
+        root = _b64decode(parts[1])
+        if not root:
+            return None
+        return WatchMsg(root=root)
     return None
 
 
@@ -100,6 +110,10 @@ def encode_pre(session: str, ts: float, cwd: str, command: str) -> str:
 
 def encode_post(session: str, ts: float, exit_code: int) -> str:
     return f"POST\t{session}\t{ts}\t{exit_code}"
+
+
+def encode_watch(root: str) -> str:
+    return "WATCH\t" + _b64(root)
 
 
 def send_line(fifo: Path, line: str) -> bool:

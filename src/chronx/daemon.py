@@ -34,7 +34,7 @@ from watchdog.observers import Observer
 
 from . import db as dbm
 from .config import Config, Paths, load_root_ignore
-from .ipc import PostMsg, PreMsg, SyncMsg, parse_line
+from .ipc import PostMsg, PreMsg, SyncMsg, WatchMsg, parse_line
 from .snapshot import compute_deltas, is_ignored_rel, scan_root
 from .store import ObjectStore
 
@@ -313,6 +313,8 @@ class Daemon:
                 self._handle_pre(msg)
             elif isinstance(msg, PostMsg):
                 self._handle_post(msg)
+            elif isinstance(msg, WatchMsg):
+                self._attach_root(msg.root)
             else:
                 self._handle_sync(msg)
         except Exception:

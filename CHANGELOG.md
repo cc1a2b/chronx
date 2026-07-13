@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.4 — 2026-07-13
+
+### Added
+- **Replay TUI v2**: a files pane per event (Tab into it for per-file diffs),
+  `/` command filter, `u` undoes the selected event (confirmed modal,
+  recorded + reversible as always), `m` drops a named mark at the current
+  moment — scrub, inspect, and revert without leaving the timeline.
+- `chronx watch <path>` — start tracking a directory immediately (baseline +
+  watch) without waiting for a command to run there.
+- `chronx daemon autostart on|off` — opt-in: each new hooked shell silently
+  brings the daemon up if it isn't running (bash, zsh, and fish hooks).
+
 ## 0.1.3 — 2026-07-13
 
 ### Added
