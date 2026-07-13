@@ -28,6 +28,8 @@ from .ops import (
     plan_rollback,
     plan_undo,
     prune,
+    range_changes,
+    record_and_run,
     resolve_event,
     restore_file,
 )
@@ -238,19 +240,69 @@ def run() -> None:
 # -------------------------------------------------------------------- diff
 
 
+def _moment_ts(conn: sqlite3.Connection, spec: str) -> float:
+    """Resolve one side of a range: mark, event id, 'now', or a time spec."""
+    spec = spec.strip()
+    if spec in ("", "now"):
+        return time.time()
+    row = dbm.get_mark(conn, spec)
+    if row is not None:
+        return float(row["ts"])
+    stripped = spec.lstrip("#")
+    if stripped.isdigit() and float(stripped) < 1e9:
+        event = dbm.event_by_id(conn, int(stripped))
+        if event is None:
+            raise click.ClickException(f"no event with id {stripped}")
+        return float(event["started_at"])
+    ts = _parse_at(spec)
+    assert ts is not None
+    return ts
+
+
 @main.command()
 @click.argument("time", default="last")
 @click.option("--stat", is_flag=True, help="Only list changed files, no content diff.")
 def diff(time: str, stat: bool) -> None:
-    """Show the filesystem changes at TIME.
+    """Show the filesystem changes at TIME — or between two moments.
 
     TIME is an event id (from blame/replay), 'last', a mark name, or a
     moment like '10m', '14:32', or '2026-07-13T14:32'.
+
+    A range `A..B` (e.g. `good-state..now`, `12..15`, `1h..10m`) shows the
+    NET difference between the two moments; changes that were undone inside
+    the window cancel out.
     """
     paths = _paths()
     conn = _open_db(paths)
     store = ObjectStore(paths.objects)
     try:
+        if ".." in time:
+            a_spec, _, b_spec = time.partition("..")
+            if not a_spec:
+                raise click.ClickException(
+                    "a range needs a start, e.g. `chronx diff good-state..now`"
+                )
+            a_ts, b_ts = _moment_ts(conn, a_spec), _moment_ts(conn, b_spec)
+            try:
+                root, changes = range_changes(conn, Path.cwd(), a_ts, b_ts)
+            except OpsError as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.secho(f"{root}: {fmt_ts(min(a_ts, b_ts))} .. "
+                        f"{fmt_ts(max(a_ts, b_ts))}", bold=True)
+            if not changes:
+                click.echo("  (no net changes between those moments)")
+                return
+            click.echo()
+            for change in changes:
+                d = change.as_delta()
+                if stat:
+                    click.echo("  " + stat_line(d))
+                else:
+                    for line in render_delta(store, d):
+                        _echo_diff_line(line)
+                    click.echo()
+            return
+
         try:
             event = resolve_event(conn, time, Path.cwd())
         except OpsError as exc:
@@ -839,6 +891,97 @@ def fsck() -> None:
     if corrupt or missing:
         raise click.exceptions.Exit(1)
     click.secho("store is healthy", fg="green")
+
+
+# -------------------------------------------------------------- exec / rerun
+
+
+@main.command("exec", context_settings={"ignore_unknown_options": True})
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def exec_cmd(command: tuple[str, ...]) -> None:
+    """Run COMMAND with recording, without needing shell hooks.
+
+    For scripts, CI, cron, or uninstrumented shells:
+    `chronx exec -- make deploy` records the command and exactly the file
+    changes it causes, like any hooked interactive command.
+    """
+    paths = _paths()
+    if not paths.db.exists():
+        raise click.ClickException("run `chronx init` first")
+    try:
+        rc = record_and_run(paths, list(command), cwd=Path.cwd())
+    except OpsError as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(rc)
+
+
+@main.command()
+@click.argument("event_id", type=int)
+@click.option("--pristine", is_flag=True,
+              help="First roll the tree back to just before the event ran.")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def rerun(event_id: int, pristine: bool, yes: bool) -> None:
+    """Re-execute a recorded command (optionally from its original pre-state).
+
+    `chronx rerun 42 --pristine` = roll back to the moment before event #42,
+    then run the same command again in its original directory — reproduce
+    exactly what happened.
+    """
+    paths = _paths()
+    conn = _open_db(paths, readonly=not pristine)
+    store = ObjectStore(paths.objects)
+    try:
+        event = dbm.event_by_id(conn, event_id)
+        if event is None:
+            raise click.ClickException(f"no event with id {event_id}")
+        if event["command"] is None:
+            raise click.ClickException(
+                f"event #{event_id} is an external change; there is no command to rerun"
+            )
+        cwd = Path(event["cwd"])
+        if not cwd.is_dir():
+            raise click.ClickException(f"original directory {cwd} no longer exists")
+
+        _echo_event_header(event)
+        if pristine:
+            ts = float(event["started_at"]) - 1e-6
+            try:
+                plan = plan_rollback(
+                    conn, store, cwd, ts, f"just before event #{event_id}"
+                )
+            except OpsError as exc:
+                raise click.ClickException(str(exc)) from exc
+            if plan.steps:
+                click.echo()
+                click.secho(
+                    f"pristine: {len(plan.applicable)} file(s) will be rolled back "
+                    f"to just before the event first",
+                    fg="cyan",
+                )
+        click.echo()
+        if not yes and not click.confirm(
+            f"Re-run this command in {cwd}?", default=False
+        ):
+            click.echo("aborted")
+            return
+        if pristine and plan.steps:
+            try:
+                rollback_event, changed = apply_rollback(conn, store, paths, plan)
+                click.secho(
+                    f"rolled back {changed} file(s) (event #{rollback_event})",
+                    fg="cyan",
+                )
+            except OpsError as exc:
+                raise click.ClickException(str(exc)) from exc
+        try:
+            rc = record_and_run(paths, str(event["command"]), cwd=cwd)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        color = "green" if rc == 0 else "red"
+        click.secho(f"command exited {rc} (recorded; see `chronx log`)", fg=color)
+        raise click.exceptions.Exit(rc)
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ doctor

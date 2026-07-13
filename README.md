@@ -64,7 +64,9 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx daemon start\|stop\|status` | Manage the background watcher. |
 | `chronx replay` | Interactive TUI timeline — scrub with arrow keys; auto-follows the live session; `c` hides no-change commands. |
 | `chronx log` | Quick plain-text timeline (`-n 50`, `--changes-only`, `--all-roots`). |
-| `chronx diff <time>` | Show the filesystem changes at that moment (`last`, an event id, `10m`, `14:32`, an ISO date...). |
+| `chronx diff <time>` | Changes at a moment (`last`, an event id, a mark, `10m`, `14:32`) — or NET changes between two: `chronx diff good-state..now`. |
+| `chronx exec -- <cmd>` | Run + record a command without shell hooks (scripts, CI, cron). |
+| `chronx rerun <event>` | Re-execute a recorded command; `--pristine` reproduces its original pre-state first. |
 | `chronx blame <file>` | Which commands touched this file, and when. |
 | `chronx cat <file>` | Print the file's recorded content at any moment (`--at 10m`, `--event 42 --before`). |
 | `chronx restore <file>` | Put a single file back to its state at any moment (reversible, confirmed). |
@@ -185,6 +187,10 @@ matched against file basenames.
 - Tracks regular files only: symlinks, sockets, and empty directories are not
   recorded; files over the size cap are ignored (and stop being tracked if
   they grow past it).
+- The very first hooked command in a brand-new directory may have its changes
+  folded into the baseline snapshot (the watch is only set up when chronx
+  first sees the directory). `chronx exec` doesn't have this race — it waits
+  for the watch before running.
 - Two commands running simultaneously in the *same* directory race for
   attribution; the first to finish claims the change.
 - chronx is a workflow debugger, not a backup system — the object store lives

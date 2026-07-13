@@ -85,8 +85,21 @@ def parse_line(line: str) -> Message | None:
     return None
 
 
+def _b64(s: str) -> str:
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
 def encode_sync(root: str) -> str:
-    return "SYNC\t" + base64.b64encode(root.encode("utf-8")).decode("ascii")
+    return "SYNC\t" + _b64(root)
+
+
+def encode_pre(session: str, ts: float, cwd: str, command: str) -> str:
+    """Same wire format the shell hooks produce (for chronx exec/rerun)."""
+    return f"PRE\t{session}\t{ts}\t{_b64(cwd)}\t{_b64(command[:4096])}"
+
+
+def encode_post(session: str, ts: float, exit_code: int) -> str:
+    return f"POST\t{session}\t{ts}\t{exit_code}"
 
 
 def send_line(fifo: Path, line: str) -> bool:

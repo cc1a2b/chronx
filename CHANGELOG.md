@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 — 2026-07-13
+
+### Added
+- **Range diff**: `chronx diff A..B` shows the NET difference between any two
+  moments (marks, event ids, times, `now`) — changes undone inside the window
+  cancel out. Works with `--stat`.
+- **`chronx exec -- CMD...`** — record a command without shell hooks: for
+  scripts, CI, cron, or uninstrumented shells. Exit code is passed through.
+- **`chronx rerun <event>`** — re-execute a recorded command in its original
+  directory; `--pristine` first rolls the tree back to just before the event,
+  reproducing the original conditions. The rerun is recorded like any command.
+
 ## 0.1.2 — 2026-07-13
 
 ### Added

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import shlex
 import sqlite3
 import stat as statmod
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from pathlib import Path
 
 from . import db as dbm
 from .config import Paths
-from .ipc import encode_sync, send_line
+from .ipc import encode_post, encode_pre, encode_sync, send_line
 from .store import ObjectStore, hash_bytes
 from .when import fmt_ts
 
@@ -651,6 +653,159 @@ def apply_rollback(
     )
     send_line(paths.fifo, encode_sync(str(plan.root)))
     return event_id, len(deltas)
+
+
+# ---------------------------------------------------------------- range diff
+
+
+@dataclass(frozen=True)
+class RangeChange:
+    """Net difference of one file between two moments."""
+
+    rel: str
+    a_hash: str | None
+    b_hash: str | None
+    a_size: int | None
+    b_size: int | None
+    a_mode: int | None
+    b_mode: int | None
+
+    def as_delta(self) -> dbm.Delta:
+        if self.a_hash is None:
+            change = "A"
+        elif self.b_hash is None:
+            change = "D"
+        else:
+            change = "M"
+        return dbm.Delta(
+            self.rel, change, self.a_hash, self.b_hash,
+            self.a_size, self.b_size, self.a_mode, self.b_mode,
+        )
+
+
+def range_changes(
+    conn: sqlite3.Connection, cwd: Path, a_ts: float, b_ts: float
+) -> tuple[Path, list[RangeChange]]:
+    """Net file changes between two moments (state@a vs state@b).
+
+    A file that changed and changed back inside the window nets to nothing
+    and is omitted.
+    """
+    if b_ts < a_ts:
+        a_ts, b_ts = b_ts, a_ts
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root_id = int(root_row["id"])
+
+    changes: list[RangeChange] = []
+    for rel in conn.execute(
+        "SELECT DISTINCT d.path FROM deltas d JOIN events e ON e.id = d.event_id"
+        " WHERE e.root_id = ? AND e.started_at > ? AND e.started_at <= ?"
+        " ORDER BY d.path",
+        (root_id, a_ts, b_ts),
+    ):
+        rel = rel["path"]
+        first = dbm.first_delta_after(conn, root_id, rel, a_ts)
+        last = dbm.last_delta_for_path(conn, root_id, rel, at=b_ts)
+        if first is None or last is None:  # defensive; window query implies both
+            continue
+        a_hash, b_hash = first["before_hash"], last["after_hash"]
+        if a_hash == b_hash:
+            continue  # net zero inside the window
+        changes.append(
+            RangeChange(
+                rel=rel,
+                a_hash=a_hash, b_hash=b_hash,
+                a_size=first["before_size"], b_size=last["after_size"],
+                a_mode=first["before_mode"], b_mode=last["after_mode"],
+            )
+        )
+    return Path(root_row["path"]), changes
+
+
+# ------------------------------------------------------------- exec / rerun
+
+
+def _wait_for_root_attach(paths: Paths, cwd: Path, *, timeout: float = 5.0) -> None:
+    """Block until the daemon is watching cwd's root (or give up quietly).
+
+    A command's changes can only be attributed if the watch and baseline
+    exist BEFORE the command writes anything. Interactive hooks can't wait,
+    but `chronx exec` can — making fresh-root recording deterministic.
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        conn = dbm.connect(paths.db, readonly=True)
+    except sqlite3.Error:
+        return
+    try:
+        root_row = None
+        while time.monotonic() < deadline:
+            root_row = dbm.root_for_path(conn, cwd)
+            if root_row is not None:
+                break
+            time.sleep(0.05)
+        if root_row is None:
+            return
+        # Root row appears before the baseline scan finishes; wait briefly
+        # for manifest rows too (an empty dir legitimately never gets any).
+        sub_deadline = min(deadline, time.monotonic() + 2.0)
+        while time.monotonic() < sub_deadline:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM manifest WHERE root_id = ?",
+                (root_row["id"],),
+            ).fetchone()[0]
+            if n:
+                return
+            time.sleep(0.05)
+    finally:
+        conn.close()
+
+
+def record_and_run(
+    paths: Paths,
+    command: list[str] | str,
+    *,
+    cwd: Path,
+    session: str | None = None,
+) -> int:
+    """Run a command while recording it through the daemon, exactly as an
+    instrumented shell would (PRE before, POST with the exit code after).
+
+    Strings run through $SHELL -c; argv lists run directly. Requires a
+    running daemon — otherwise there is nothing to record into.
+    """
+    if isinstance(command, str):
+        display = command
+        argv = [os.environ.get("SHELL") or "/bin/sh", "-c", command]
+    else:
+        display = shlex.join(command)
+        argv = command
+    session = (
+        session
+        or os.environ.get("CHRONX_SESSION")
+        or f"chronx-exec-{os.getpid()}"
+    )
+
+    if not send_line(paths.fifo, encode_pre(session, time.time(), str(cwd), display)):
+        raise OpsError(
+            "the chronx daemon is not running (`chronx daemon start`), "
+            "so this command would not be recorded"
+        )
+    _wait_for_root_attach(paths, cwd)
+    rc = 130  # if we die on the way, close the window as interrupted
+    try:
+        rc = subprocess.run(argv, cwd=str(cwd)).returncode
+    except FileNotFoundError as exc:
+        rc = 127
+        raise OpsError(f"cannot run {display!r}: {exc}") from exc
+    except KeyboardInterrupt:
+        rc = 130
+        raise
+    finally:
+        send_line(paths.fifo, encode_post(session, time.time(), rc))
+    return rc
 
 
 # ------------------------------------------------------------------ gc
