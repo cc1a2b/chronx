@@ -326,6 +326,7 @@ def recent_events(
     root_id: int | None = None,
     limit: int = 500,
     changes_only: bool = False,
+    session: str | None = None,
 ) -> list[sqlite3.Row]:
     """Most recent events, returned oldest-first (timeline order)."""
     where: list[str] = []
@@ -335,6 +336,9 @@ def recent_events(
         params.append(root_id)
     if changes_only:
         where.append("EXISTS (SELECT 1 FROM deltas d WHERE d.event_id = events.id)")
+    if session is not None:
+        where.append("session = ?")
+        params.append(session)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
     rows = list(
@@ -345,6 +349,111 @@ def recent_events(
     )
     rows.reverse()
     return rows
+
+
+def events_between(
+    conn: sqlite3.Connection,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    root_id: int | None = None,
+    session: str | None = None,
+    changes_only: bool = False,
+    limit: int = 2000,
+) -> list[sqlite3.Row]:
+    """Events in a time window, oldest-first."""
+    where: list[str] = []
+    params: list[object] = []
+    if since is not None:
+        where.append("started_at >= ?")
+        params.append(since)
+    if until is not None:
+        where.append("started_at <= ?")
+        params.append(until)
+    if root_id is not None:
+        where.append("root_id = ?")
+        params.append(root_id)
+    if session is not None:
+        where.append("session = ?")
+        params.append(session)
+    if changes_only:
+        where.append("EXISTS (SELECT 1 FROM deltas d WHERE d.event_id = events.id)")
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    params.append(limit)
+    return list(
+        conn.execute(
+            f"SELECT * FROM events{clause} ORDER BY id ASC LIMIT ?", params
+        )
+    )
+
+
+def events_after(
+    conn: sqlite3.Connection,
+    after_id: int,
+    *,
+    root_id: int | None = None,
+    changes_only: bool = False,
+) -> list[sqlite3.Row]:
+    """Events newer than a given id, oldest-first (for live tailing)."""
+    where = ["id > ?"]
+    params: list[object] = [after_id]
+    if root_id is not None:
+        where.append("root_id = ?")
+        params.append(root_id)
+    if changes_only:
+        where.append("EXISTS (SELECT 1 FROM deltas d WHERE d.event_id = events.id)")
+    return list(
+        conn.execute(
+            f"SELECT * FROM events WHERE {' AND '.join(where)} ORDER BY id ASC",
+            params,
+        )
+    )
+
+
+def list_sessions(conn: sqlite3.Connection, *, limit: int = 20) -> list[sqlite3.Row]:
+    """Per-session activity summary, most recently active first."""
+    return list(
+        conn.execute(
+            "SELECT e.session AS session, COUNT(*) AS events,"
+            " SUM(COALESCE(dc.n, 0)) AS changes,"
+            " MIN(e.started_at) AS first_ts, MAX(e.started_at) AS last_ts,"
+            " MAX(e.cwd) AS cwd"
+            " FROM events e LEFT JOIN"
+            "  (SELECT event_id, COUNT(*) AS n FROM deltas GROUP BY event_id) dc"
+            "  ON dc.event_id = e.id"
+            " GROUP BY e.session ORDER BY last_ts DESC LIMIT ?",
+            (limit,),
+        )
+    )
+
+
+def root_summaries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every root with its event and tracked-file counts."""
+    return list(
+        conn.execute(
+            "SELECT r.*,"
+            " (SELECT COUNT(*) FROM events e WHERE e.root_id = r.id) AS events,"
+            " (SELECT COUNT(*) FROM manifest m WHERE m.root_id = r.id) AS files"
+            " FROM roots r ORDER BY r.path"
+        )
+    )
+
+
+def forget_root(conn: sqlite3.Connection, root_id: int) -> tuple[int, int]:
+    """Erase a root and all its history. Returns (events, deltas) deleted."""
+    with conn:
+        deltas = conn.execute(
+            "DELETE FROM deltas WHERE event_id IN"
+            " (SELECT id FROM events WHERE root_id = ?)",
+            (root_id,),
+        ).rowcount
+        events = conn.execute(
+            "DELETE FROM events WHERE root_id = ?", (root_id,)
+        ).rowcount
+        conn.execute("UPDATE marks SET root_id = NULL WHERE root_id = ?", (root_id,))
+        conn.execute("DELETE FROM manifest WHERE root_id = ?", (root_id,))
+        conn.execute("DELETE FROM roots WHERE id = ?", (root_id,))
+    return events, deltas
 
 
 def max_event_id(conn: sqlite3.Connection) -> int:

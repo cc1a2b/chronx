@@ -398,7 +398,9 @@ def undo(event_id: int | None, yes: bool, force: bool) -> None:
               help="Every tracked directory, not just the current one.")
 @click.option("--changes-only", "-c", is_flag=True,
               help="Hide commands that changed no files.")
-def log_cmd(limit: int, all_roots: bool, changes_only: bool) -> None:
+@click.option("--session", "-s", default=None,
+              help="Only events from this shell session (see `chronx sessions`).")
+def log_cmd(limit: int, all_roots: bool, changes_only: bool, session: str | None) -> None:
     """Print the recent event timeline (newest last), like a quick git log."""
     paths = _paths()
     conn = _open_db(paths)
@@ -408,7 +410,8 @@ def log_cmd(limit: int, all_roots: bool, changes_only: bool) -> None:
             root = dbm.root_for_path(conn, Path.cwd())
             root_id = int(root["id"]) if root is not None else None
         rows = dbm.recent_events(
-            conn, root_id=root_id, limit=limit, changes_only=changes_only
+            conn, root_id=root_id, limit=limit, changes_only=changes_only,
+            session=session,
         )
         if not rows:
             click.echo("no events recorded" + ("" if all_roots else " for this directory"))
@@ -836,6 +839,258 @@ def fsck() -> None:
     if corrupt or missing:
         raise click.exceptions.Exit(1)
     click.secho("store is healthy", fg="green")
+
+
+# ------------------------------------------------------------------ doctor
+
+
+@main.command()
+def doctor() -> None:
+    """Diagnose the recording pipeline: store, daemon, pipe, hooks, disk."""
+    from .doctor import FAIL, OK, run_checks
+
+    checks = run_checks(_paths())
+    hard_fail = False
+    for c in checks:
+        if c.status == OK:
+            icon = click.style("✓", fg="green")
+        elif c.status == FAIL:
+            icon, hard_fail = click.style("✗", fg="red"), True
+        else:
+            icon = click.style("!", fg="yellow")
+        click.echo(f" {icon} {c.label:<12} {c.detail}")
+    if hard_fail:
+        raise click.exceptions.Exit(1)
+
+
+# -------------------------------------------------------------------- tail
+
+
+@main.command()
+@click.option("--backlog", "-n", default=5, show_default=True,
+              help="Recent events to print before following.")
+@click.option("--stat", is_flag=True, help="List changed files under each event.")
+@click.option("--changes-only", "-c", is_flag=True,
+              help="Hide commands that changed no files.")
+@click.option("--all-roots", is_flag=True,
+              help="Follow every tracked directory, not just the current one.")
+def tail(backlog: int, stat: bool, changes_only: bool, all_roots: bool) -> None:
+    """Follow the event stream live, like `tail -f` for your workflow."""
+    paths = _paths()
+    conn = _open_db(paths)
+
+    def emit(r: sqlite3.Row) -> None:
+        counts = dbm.delta_counts(conn, int(r["id"]))
+        total = sum(counts.values())
+        delta_s = (
+            click.style(f"±{total:<3}", fg="magenta", bold=True)
+            if total
+            else click.style("·   ", dim=True)
+        )
+        exit_code = r["exit_code"]
+        exit_s = (
+            click.style(" - ", dim=True)
+            if exit_code is None
+            else click.style(f"{exit_code:>3}", fg="green" if exit_code == 0 else "red")
+        )
+        click.echo(
+            f"#{r['id']:<5} {fmt_ts(r['started_at'])}  {delta_s} {exit_s}  "
+            + click.style(describe_command(r), fg="yellow" if r["command"] else None,
+                          dim=r["command"] is None)
+        )
+        if stat and total:
+            for d in dbm.deltas_for(conn, int(r["id"])):
+                click.echo("       " + stat_line(d))
+
+    try:
+        root_id = None
+        if not all_roots:
+            root = dbm.root_for_path(conn, Path.cwd())
+            root_id = int(root["id"]) if root is not None else None
+        rows = dbm.recent_events(
+            conn, root_id=root_id, limit=backlog, changes_only=changes_only
+        )
+        last_id = dbm.max_event_id(conn)
+        for r in rows:
+            emit(r)
+        click.secho("--- following (Ctrl-C to stop) ---", dim=True, err=True)
+        while True:
+            time.sleep(0.5)
+            fresh = dbm.events_after(
+                conn, last_id, root_id=root_id, changes_only=changes_only
+            )
+            newest = dbm.max_event_id(conn)
+            if newest > last_id:
+                last_id = newest
+            for r in fresh:
+                emit(r)
+    except KeyboardInterrupt:
+        click.echo()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- sessions
+
+
+@main.command()
+@click.option("--limit", "-n", default=20, show_default=True)
+def sessions(limit: int) -> None:
+    """List recorded shell sessions, most recently active first."""
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        rows = dbm.list_sessions(conn, limit=limit)
+        if not rows:
+            click.echo("no sessions recorded")
+            return
+        current = os.environ.get("CHRONX_SESSION")
+        for r in rows:
+            sid = r["session"] or "(external)"
+            mark = "*" if current and r["session"] == current else " "
+            click.echo(
+                f" {mark} {sid:<24} {r['events']:>4} cmd(s), ±{r['changes'] or 0:<4} "
+                f"{fmt_ts(r['first_ts'])} → {fmt_ts(r['last_ts'])}"
+            )
+            click.secho(f"      {r['cwd']}", dim=True)
+        if current:
+            click.secho(f"\n* = this shell ({current}); "
+                        f"filter with `chronx log -s <session>`", dim=True)
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ report
+
+
+@main.command()
+@click.option("--since", default="1h", show_default=True,
+              help="Start of the window ('30m', '14:32', a mark, ISO...).")
+@click.option("--until", default=None, help="End of the window (default: now).")
+@click.option("--session", "-s", default=None, help="Only this shell session.")
+@click.option("--full", is_flag=True, help="Include unified diffs, not just file lists.")
+@click.option("--all-roots", is_flag=True)
+def report(since: str, until: str | None, session: str | None,
+           full: bool, all_roots: bool) -> None:
+    """Write a shareable Markdown report of what you did (and what it changed).
+
+    Pipe it wherever: `chronx report --since 2h --full > debug-session.md`.
+    """
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+
+    def moment(spec: str) -> float:
+        row = dbm.get_mark(conn, spec)
+        if row is not None:
+            return float(row["ts"])
+        ts = _parse_at(spec)
+        assert ts is not None
+        return ts
+
+    try:
+        since_ts = moment(since)
+        until_ts = moment(until) if until else None
+        root_id = None
+        root_label = "all tracked directories"
+        if not all_roots:
+            root = dbm.root_for_path(conn, Path.cwd())
+            if root is not None:
+                root_id, root_label = int(root["id"]), str(root["path"])
+        rows = dbm.events_between(
+            conn, since=since_ts, until=until_ts, root_id=root_id, session=session
+        )
+        window = f"{fmt_ts(since_ts)} → {fmt_ts(until_ts) if until_ts else 'now'}"
+        click.echo(f"# chronx report\n\n- scope: `{root_label}`\n- window: {window}")
+        if session:
+            click.echo(f"- session: `{session}`")
+        changing = [r for r in rows if sum(dbm.delta_counts(conn, r['id']).values())]
+        click.echo(f"- {len(rows)} command(s), {len(changing)} changed files\n")
+        for r in rows:
+            deltas = dbm.deltas_for(conn, int(r["id"]))
+            exit_s = "" if r["exit_code"] is None else f" · exit {r['exit_code']}"
+            click.echo(
+                f"## #{r['id']} · {fmt_ts(r['started_at'])}{exit_s}\n\n"
+                f"```console\n$ {describe_command(r)}\n```\n"
+            )
+            if not deltas:
+                click.echo("_no filesystem changes_\n")
+                continue
+            for d in deltas:
+                click.echo(f"- `{stat_line(d)}`")
+            click.echo()
+            if full:
+                for d in deltas:
+                    click.echo("```diff")
+                    for line in render_delta(store, d, max_lines=200):
+                        click.echo(line)
+                    click.echo("```\n")
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------- roots
+
+
+@main.group(invoke_without_command=True)
+@click.pass_context
+def roots(ctx: click.Context) -> None:
+    """List or forget tracked directories."""
+    if ctx.invoked_subcommand is not None:
+        return
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        rows = dbm.root_summaries(conn)
+        if not rows:
+            click.echo("no tracked directories yet")
+            return
+        for r in rows:
+            click.echo(
+                f"  {r['path']}\n"
+                f"    {r['events']} event(s), {r['files']} tracked file(s), "
+                f"since {fmt_ts(r['added_at'])}"
+            )
+    finally:
+        conn.close()
+
+
+@roots.command()
+@click.argument("path", type=click.Path(path_type=Path))
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def forget(path: Path, yes: bool) -> None:
+    """Stop tracking PATH and erase its recorded history.
+
+    Blobs shared with other roots survive; run `chronx gc` afterwards to
+    reclaim the rest. The daemon must be stopped."""
+    paths = _paths()
+    pid = daemonmod.daemon_pid(paths)
+    if pid is not None:
+        raise click.ClickException(
+            f"daemon is running (pid {pid}) — stop it first: chronx daemon stop"
+        )
+    conn = _open_db(paths, readonly=False)
+    try:
+        resolved = str(path.resolve())
+        row = conn.execute("SELECT * FROM roots WHERE path = ?", (resolved,)).fetchone()
+        if row is None:
+            raise click.ClickException(f"{resolved} is not a tracked root "
+                                       "(see `chronx roots`)")
+        events = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE root_id = ?", (row["id"],)
+        ).fetchone()["n"]
+        click.echo(f"forgetting {resolved}: erases {events} event(s) and its manifest")
+        if not yes and not click.confirm("Proceed?", default=False):
+            click.echo("aborted")
+            return
+        deleted_events, deleted_deltas = dbm.forget_root(conn, int(row["id"]))
+        click.secho(
+            f"forgot {resolved} ({deleted_events} events, {deleted_deltas} deltas); "
+            "run `chronx gc` to reclaim blob space",
+            fg="green",
+        )
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------- stats

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 — 2026-07-13
+
+### Added
+- `chronx doctor` — end-to-end pipeline diagnostics: store, database
+  integrity, daemon + fifo reader probe, recent log errors, hook installation
+  per shell, whether *this* shell is instrumented, watchdog backend, disk space.
+- `chronx tail` — follow the event stream live (`-n` backlog, `--stat` file
+  lists, `-c` changes only), like `tail -f` for your workflow.
+- `chronx sessions` — per-shell-session summary (commands, changes, time
+  span); `chronx log -s <session>` filters the timeline.
+- `chronx report` — shareable Markdown of a time window / session
+  (`--since 2h --full > debug-session.md`), with stat lists and optional diffs.
+- `chronx roots` / `chronx roots forget <path>` — list tracked directories,
+  or erase one's history entirely (daemon stopped, confirmed, gc reclaims blobs).
+
 ## 0.1.1 — 2026-07-13
 
 ### Added

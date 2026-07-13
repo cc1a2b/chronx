@@ -72,7 +72,12 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx rollback <moment>` | Revert the **whole tree** to a mark, time, or event — one reversible event. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
+| `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |
+| `chronx sessions` | List recorded shell sessions; `chronx log -s <id>` filters to one. |
+| `chronx report` | Shareable Markdown of a window/session: `chronx report --since 2h --full > session.md`. |
 | `chronx stats` | Hottest files, noisiest commands, store size. |
+| `chronx doctor` | Diagnose the pipeline: store, db, daemon, fifo, hooks, disk. |
+| `chronx roots` | List tracked directories; `roots forget <path>` erases one's history. |
 | `chronx fsck` | Verify blob integrity and that all referenced history is present. |
 | `chronx gc` | Prune events older than `--keep-days` (default 30) and unreferenced blobs; `--dry-run` previews. |
 
