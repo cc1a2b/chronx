@@ -63,6 +63,7 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx hook bash\|zsh` | Print the raw hook script (what `init` tells you to eval). |
 | `chronx daemon start\|stop\|status` | Manage the background watcher. |
 | `chronx replay` | Interactive TUI: scrub the timeline, Tab into the files pane for per-file diffs, `/` filter, `u` undo, `m` mark — live-follows the session. |
+| `chronx serve` | Live web UI in the browser: timeline, colorized diffs, blame, search, stats (read-only). |
 | `chronx watch <path>` | Start tracking a directory now, before any command runs there. |
 | `chronx log` | Quick plain-text timeline (`-n 50`, `--changes-only`, `--all-roots`). |
 | `chronx diff <time>` | Changes at a moment (`last`, an event id, a mark, `10m`, `14:32`) — or NET changes between two: `chronx diff good-state..now`. |

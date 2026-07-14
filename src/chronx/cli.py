@@ -1655,6 +1655,52 @@ def stats(all_roots: bool, top: int) -> None:
         conn.close()
 
 
+# ------------------------------------------------------------------- serve
+
+
+@main.command()
+@click.option("--port", "-p", default=7373, show_default=True)
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Bind address. Leave as localhost unless you mean to expose it.")
+@click.option("--open", "open_browser", is_flag=True,
+              help="Open the UI in your browser once it's up.")
+def serve(port: int, host: str, open_browser: bool) -> None:
+    """Serve a live web UI over your recorded history (read-only)."""
+    from .webui import make_server
+
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        root = dbm.root_for_path(conn, Path.cwd())
+        default_root = int(root["id"]) if root is not None else None
+    finally:
+        conn.close()
+
+    try:
+        server = make_server(paths, host, port, default_root)
+    except OSError as exc:
+        raise click.ClickException(
+            f"cannot bind {host}:{port} ({exc}); try another --port"
+        ) from exc
+
+    url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}/"
+    click.secho(f"chronx web UI on {url}", fg="green")
+    if host not in ("127.0.0.1", "localhost"):
+        click.secho(
+            "  ! bound to a non-local address — anyone who can reach it can read "
+            "your recorded files", fg="yellow")
+    click.secho("  read-only; Ctrl-C to stop", dim=True)
+    if open_browser:
+        import webbrowser
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("\nstopped")
+    finally:
+        server.server_close()
+
+
 # ------------------------------------------------------------------ replay
 
 

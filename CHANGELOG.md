@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.8 — 2026-07-14
+
+### Added
+- **`chronx serve`** — a live web UI over your recorded history. An embedded,
+  dependency-free HTTP server (stdlib only) serves a single-page dashboard:
+  a live-updating timeline, colorized per-command unified diffs, click-through
+  file blame, command search + `S:` content pickaxe, and a stats view. Reads
+  the store READ-ONLY (a fresh connection per request), binds to localhost by
+  default, and never touches the recording/undo/rollback write-paths.
+
 ## 0.1.7 — 2026-07-14
 
 ### Added
