@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.7 — 2026-07-14
+
+### Added
+- **`chronx to-git <dir>`** — replay a directory's entire recorded history
+  into a brand-new git repository: one commit per command (author date = when
+  it ran, message = the command, with `chronx-event`/`cwd`/`exit` trailers),
+  preceded by a "chronx baseline" commit holding the full tree at tracking
+  start. Turns an ad-hoc shell session into real, reviewable git history you
+  can `git log` / `git blame` / `git bisect` / push to a remote.
+
+  Implemented by synthesizing a `git fast-import` stream directly: chronx's
+  per-command deltas map onto fast-import `M`/`D` ops and the content-addressed
+  blob store onto fast-import blob marks (deduped by hash). The chronx store is
+  only read; nothing in the recording pipeline is touched.
+
 ## 0.1.6 — 2026-07-14
 
 ### Added

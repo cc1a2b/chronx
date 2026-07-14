@@ -1395,6 +1395,53 @@ def status(stat: bool, all_roots: bool) -> None:
         conn.close()
 
 
+# ------------------------------------------------------------------ to-git
+
+
+@main.command("to-git")
+@click.argument("target", type=click.Path(path_type=Path))
+@click.option("--root", "root_path", type=click.Path(path_type=Path), default=None,
+              help="Which tracked root to export (default: the one containing cwd).")
+@click.option("--branch", default="main", show_default=True,
+              help="Branch name for the generated history.")
+@click.option("--no-checkout", is_flag=True,
+              help="Leave the new repo bare of a working tree (history only).")
+def to_git_cmd(target: Path, root_path: Path | None, branch: str,
+               no_checkout: bool) -> None:
+    """Replay a directory's recorded history into a new git repo at TARGET.
+
+    Turns an ad-hoc shell session into real, reviewable git history — one
+    commit per command (author date = when it ran, message = the command) —
+    that you can `git log`, `git blame`, `git bisect`, or push to a remote.
+    """
+    from .gitexport import GitExportError, to_git
+
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+    try:
+        anchor = (root_path or Path.cwd()).resolve()
+        row = dbm.root_for_path(conn, anchor)
+        if row is None:
+            raise click.ClickException(f"{anchor} is not inside any tracked directory")
+        try:
+            stats = to_git(
+                conn, store, row, target, branch=branch, checkout=not no_checkout
+            )
+        except GitExportError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"wrote git repo at {stats.target}", fg="green")
+        click.echo(
+            f"  {stats.commits} commit(s) on '{stats.branch}' "
+            f"({stats.events} command(s) + baseline), {stats.blobs} blob(s)"
+        )
+        click.secho(
+            f"  explore: git -C {stats.target} log --stat", dim=True
+        )
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------- export / import
 
 

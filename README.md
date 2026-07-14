@@ -81,6 +81,7 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx report` | Shareable Markdown of a window/session: `chronx report --since 2h --full > session.md`. |
 | `chronx status` | Working-tree changes not yet recorded (drift vs the last snapshot). |
 | `chronx export` / `import` | Move recorded history between machines; `import <a> --as .` re-attaches it here. |
+| `chronx to-git <dir>` | Replay your session into a real git repo — one commit per command. |
 | `chronx stats` | Hottest files, noisiest commands, store size. |
 | `chronx doctor` | Diagnose the pipeline: store, db, daemon, fifo, hooks, disk. |
 | `chronx roots` | List tracked directories; `roots forget <path>` erases one's history. |
@@ -170,6 +171,22 @@ last one.
   on your next command.
 - Blobs are stored once per unique content (`objects/<blake3[:2]>/<rest>`),
   zlib-compressed. Unchanged files cost nothing, ever.
+
+## Turn a session into git history
+
+Debugged for hours with no commits? Replay the whole thing into a real git
+repository — one commit per command:
+
+```sh
+chronx to-git /tmp/session.git
+git -C /tmp/session.git log --stat     # every command, as a commit
+git -C /tmp/session.git blame config.py
+```
+
+chronx synthesizes a `git fast-import` stream from its recorded deltas (a
+"chronx baseline" commit for the starting tree, then one commit per command
+with the command as the message). The result is ordinary git — browse it,
+bisect it, or `git push` it to GitHub. Your chronx store is only read.
 
 ## Storage layout
 
