@@ -75,6 +75,8 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx undo` | Revert the working dir to its state before the last command. |
 | `chronx rollback <moment>` | Revert the **whole tree** to a mark, time, or event — one reversible event. |
 | `chronx bisect --good <m> -- <test>` | Binary-search history for the command that broke your test. |
+| `chronx fork <name>` / `switch <name>` | Alternate timelines: branch history, experiment, switch between realities. |
+| `chronx branches` | List the timelines for this directory. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |
@@ -127,6 +129,23 @@ chronx reconstructs the tree at each candidate moment from recorded blobs,
 runs the test, and restores your starting state when done. `--good` is a
 moment the test passed (a mark, event id, or time); `--bad` defaults to the
 latest event.
+
+### Alternate timelines
+
+chronx isn't limited to one line of history. Fork the timeline, try a risky
+approach on a separate branch, and switch back and forth — the working tree
+is reconstructed each time, and both realities are kept:
+
+```sh
+chronx daemon stop                 # switching rewrites the tree
+chronx fork try-async              # branch off "main", start experimenting
+# ... hack, run commands, they record on try-async ...
+chronx switch main                 # tree snaps back to main's state
+chronx branches                    # see both timelines
+```
+
+`chronx fork <name> --at 1h` forks from a *past* moment, so you can explore
+what might have happened if you'd taken a different path an hour ago.
 
 ### Single-file time travel
 

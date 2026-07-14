@@ -40,9 +40,10 @@ def resolve_event(
 
     root = dbm.root_for_path(conn, cwd)
     root_id = int(root["id"]) if root is not None else None
+    branch_id = dbm.active_branch_id(conn, root_id) if root_id is not None else None
 
     if spec == "last":
-        row = dbm.last_event(conn, root_id=root_id)
+        row = dbm.last_event(conn, root_id=root_id, branch_id=branch_id)
         if row is None and root_id is not None:
             row = dbm.last_event(conn)
         if row is None:
@@ -64,7 +65,7 @@ def resolve_event(
             ts = parse_when(spec)
         except WhenParseError as exc:
             raise OpsError(str(exc)) from exc
-    row = dbm.event_at(conn, ts, root_id=root_id)
+    row = dbm.event_at(conn, ts, root_id=root_id, branch_id=branch_id)
     if row is None and root_id is not None:
         row = dbm.event_at(conn, ts)
     if row is None:
@@ -99,7 +100,9 @@ def blame_file(conn: sqlite3.Connection, file: Path) -> tuple[str, list[BlameEnt
             "(run a command there from an instrumented shell first)"
         )
     rel = os.path.relpath(resolved, root["path"]).replace(os.sep, "/")
-    rows = dbm.events_touching(conn, int(root["id"]), rel)
+    rows = dbm.events_touching(
+        conn, int(root["id"]), rel, branch_id=dbm.active_branch_id(conn, int(root["id"]))
+    )
     entries = [
         BlameEntry(
             event_id=int(r["id"]),
@@ -331,7 +334,10 @@ def find_undo_target(conn: sqlite3.Connection, cwd: Path) -> sqlite3.Row:
     """Latest event *with deltas* for the root containing cwd."""
     root = dbm.root_for_path(conn, cwd)
     root_id = int(root["id"]) if root is not None else None
-    row = dbm.last_event(conn, root_id=root_id, with_deltas_only=True)
+    branch_id = dbm.active_branch_id(conn, root_id) if root_id is not None else None
+    row = dbm.last_event(
+        conn, root_id=root_id, with_deltas_only=True, branch_id=branch_id
+    )
     if row is None:
         raise OpsError(
             "no file-changing events recorded"
@@ -542,10 +548,13 @@ def plan_rollback(
             f"({fmt_ts(root_row['added_at'])}); nothing recorded that far back"
         )
 
+    branch_id = dbm.active_branch_id(conn, root_id)
     prefix = path_prefix.strip("/") if path_prefix else None
     steps: list[RollbackStep] = []
-    for rel in dbm.paths_changed_since(conn, root_id, ts, path_prefix=prefix):
-        first = dbm.first_delta_after(conn, root_id, rel, ts)
+    for rel in dbm.paths_changed_since(
+        conn, root_id, ts, path_prefix=prefix, branch_id=branch_id
+    ):
+        first = dbm.first_delta_after(conn, root_id, rel, ts, branch_id=branch_id)
         if first is None:  # raced away; shouldn't happen
             continue
         target_hash = first["before_hash"]
@@ -655,6 +664,132 @@ def apply_rollback(
     return event_id, len(deltas)
 
 
+# ------------------------------------------------------------------ branches
+
+
+@dataclass(frozen=True)
+class BranchResult:
+    name: str
+    files_changed: int
+    at: float
+
+
+def _materialize(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    root_id: int,
+    root: Path,
+    target: dict[str, tuple[str | None, int | None]],
+) -> int:
+    """Make the working tree + manifest match `target` (a full tree state).
+
+    Writes/deletes files, rewrites the manifest table to the new state, and
+    sends the daemon a SYNC. Returns the number of files changed on disk.
+    """
+    missing = [
+        rel for rel, (h, _m) in target.items() if h is not None and not store.has(h)
+    ]
+    if missing:
+        raise OpsError(
+            f"{len(missing)} file(s) have missing blobs (first: {missing[0]}); "
+            "run `chronx fsck`"
+        )
+    current = dbm.load_manifest(conn, root_id)
+    changed = 0
+    new_manifest: dict[str, dbm.ManifestEntry] = {}
+    for rel, (target_hash, target_mode) in target.items():
+        if target_hash is None:
+            continue
+        full = root / rel
+        data, st = _current_state(full)
+        if not (st is not None and data is not None and hash_bytes(data) == target_hash):
+            try:
+                _write_atomic(full, store.get(target_hash), target_mode)
+            except OSError as exc:
+                raise OpsError(f"could not write {rel}: {exc}") from exc
+            changed += 1
+        st = os.lstat(full)
+        new_manifest[rel] = dbm.ManifestEntry(
+            hash=target_hash, size=st.st_size, mtime=st.st_mtime, mode=st.st_mode
+        )
+    for rel in current:
+        if rel not in new_manifest:
+            try:
+                (root / rel).unlink(missing_ok=True)
+            except OSError as exc:
+                raise OpsError(f"could not remove {rel}: {exc}") from exc
+            changed += 1
+    with conn:
+        conn.execute("DELETE FROM manifest WHERE root_id = ?", (root_id,))
+        dbm.apply_manifest(conn, root_id, new_manifest, set())
+    send_line(paths.fifo, encode_sync(str(root)))
+    return changed
+
+
+def fork_branch(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    cwd: Path,
+    name: str,
+    *,
+    at_ts: float | None = None,
+) -> BranchResult:
+    """Create a new timeline off the active one and switch to it.
+
+    Forks at `at_ts` (default: now = current tip). Reconstructs the working
+    tree to the fork point, so a past `at_ts` gives you that past state on a
+    fresh branch. New commands record on the new branch.
+    """
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root_id = int(root_row["id"])
+    if dbm.branch_by_name(conn, root_id, name) is not None:
+        raise OpsError(f"a timeline named {name!r} already exists here")
+    active = dbm.active_branch(conn, root_id)
+    if active is None:
+        raise OpsError("this root has no active timeline (store not initialized?)")
+    base_ts = at_ts if at_ts is not None else time.time()
+    if base_ts < float(root_row["added_at"]):
+        raise OpsError("cannot fork before tracking began")
+
+    new_id = dbm.create_branch(
+        conn, root_id, name, parent_branch_id=int(active["id"]), base_ts=base_ts
+    )
+    dbm.set_active_branch(conn, root_id, new_id)
+    new_branch = dbm.get_branch(conn, new_id)
+    assert new_branch is not None
+    target = branch_state_at(conn, new_branch, time.time())
+    changed = _materialize(conn, store, paths, root_id, Path(root_row["path"]), target)
+    return BranchResult(name=name, files_changed=changed, at=base_ts)
+
+
+def switch_branch(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    cwd: Path,
+    name: str,
+) -> BranchResult:
+    """Switch to an existing timeline, reconstructing the working tree to its tip."""
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root_id = int(root_row["id"])
+    branch = dbm.branch_by_name(conn, root_id, name)
+    if branch is None:
+        raise OpsError(f"no timeline named {name!r} here (see `chronx branches`)")
+    active = dbm.active_branch(conn, root_id)
+    if active is not None and int(active["id"]) == int(branch["id"]):
+        raise OpsError(f"already on {name!r}")
+    target = branch_state_at(conn, branch, time.time())
+    changed = _materialize(conn, store, paths, root_id, Path(root_row["path"]), target)
+    dbm.set_active_branch(conn, root_id, int(branch["id"]))
+    return BranchResult(name=name, files_changed=changed, at=time.time())
+
+
 # ------------------------------------------------------------------ bisect
 
 
@@ -675,24 +810,52 @@ class BisectResult:
     steps: list[BisectStep]
 
 
+def branch_state_at(
+    conn: sqlite3.Connection, branch: sqlite3.Row, ts: float
+) -> dict[str, tuple[str | None, int | None]]:
+    """Full tree content of one timeline at `ts`: base snapshot + forward replay.
+
+    A branch inherits its parent's state at the fork point, then applies its
+    own events in order. main has no parent and starts from the root baseline.
+    Returns rel_path -> (hash, mode); hash None means absent.
+    """
+    parent_id = branch["parent_branch_id"]
+    if parent_id is None:
+        state: dict[str, tuple[str | None, int | None]] = {
+            p: (h, m) for p, (h, m) in dbm.root_baseline(conn, int(branch["root_id"])).items()
+        }
+    else:
+        parent = dbm.get_branch(conn, int(parent_id))
+        if parent is None:
+            state = {}
+        else:
+            state = branch_state_at(conn, parent, float(branch["base_ts"]))
+    for d in dbm.branch_deltas_ordered(conn, int(branch["id"]), ts):
+        if d["after_hash"] is None:
+            state.pop(d["path"], None)
+        else:
+            state[d["path"]] = (d["after_hash"], d["after_mode"])
+    return state
+
+
 def state_at(
     conn: sqlite3.Connection, root_id: int, ts: float
 ) -> dict[str, tuple[str | None, int | None]]:
-    """The full recorded content of every tracked file at time `ts`.
+    """The full recorded content of every tracked file at time `ts`, on the
+    active timeline. Independent of current disk state, so it can materialize
+    any historical point (not just "revert from latest")."""
+    branch = dbm.active_branch(conn, root_id)
+    if branch is not None:
+        return branch_state_at(conn, branch, ts)
 
-    Returns rel_path -> (blob_hash, mode); a hash of None means the file did
-    not exist at that moment. Independent of current disk state, so it can
-    materialize any historical point (not just "revert from latest").
-    """
+    # Fallback for a pre-branch store not yet migrated (read-only path).
     from itertools import groupby
 
     state: dict[str, tuple[str | None, int | None]] = {}
-    # Files that never changed sit at their baseline (still in the manifest).
     for row in conn.execute(
         "SELECT path, hash, mode FROM manifest WHERE root_id = ?", (root_id,)
     ):
         state[row["path"]] = (row["hash"], row["mode"])
-
     rows = conn.execute(
         "SELECT d.path AS path, d.after_hash AS after_hash, d.after_mode AS after_mode,"
         " d.before_hash AS before_hash, d.before_mode AS before_mode,"
@@ -708,7 +871,7 @@ def state_at(
             last = at_or_before[-1]
             state[path] = (last["after_hash"], last["after_mode"])
         else:
-            first = history[0]  # state before the first-ever change = baseline
+            first = history[0]
             state[path] = (first["before_hash"], first["before_mode"])
     return state
 
@@ -802,7 +965,8 @@ def bisect_history(
     candidates = [
         e
         for e in dbm.events_between(
-            conn, since=good_ts, until=bad_ts, root_id=root_id, changes_only=True
+            conn, since=good_ts, until=bad_ts, root_id=root_id, changes_only=True,
+            branch_id=dbm.active_branch_id(conn, root_id),
         )
         if float(e["started_at"]) > good_ts
     ]

@@ -126,8 +126,14 @@ def _build_stream(
             buf.append((op + "\n").encode("utf-8"))
         buf.append(b"\n")
 
-    # 1. Baseline commit: full tree at tracking start.
-    baseline = state_at(conn, root_id, float(root_row["added_at"]))
+    # Export the active timeline: baseline = its state at the fork point,
+    # then one commit per event recorded on that branch.
+    active = dbm.active_branch(conn, root_id)
+    base_ts = float(active["base_ts"]) if active is not None else float(root_row["added_at"])
+    branch_id = int(active["id"]) if active is not None else None
+
+    # 1. Baseline commit: full tree at the branch's start.
+    baseline = state_at(conn, root_id, base_ts)
     base_ops: list[str] = []
     for path, (digest, mode) in sorted(baseline.items()):
         if digest is None:
@@ -135,14 +141,18 @@ def _build_stream(
         mark = blob(digest)
         if mark is not None:
             base_ops.append(f"M {_git_mode(mode)} :{mark} {_quote_path(path)}")
-    commit(float(root_row["added_at"]), "chronx baseline\n\nchronx-event: 0\n", base_ops)
+    commit(base_ts, "chronx baseline\n\nchronx-event: 0\n", base_ops)
     yield from buf
     buf.clear()
 
-    # 2. One commit per recorded event, using its deltas as M/D ops.
-    for event in conn.execute(
-        "SELECT * FROM events WHERE root_id = ? ORDER BY id", (root_id,)
-    ):
+    # 2. One commit per recorded event on this branch, deltas as M/D ops.
+    ev_sql = "SELECT * FROM events WHERE root_id = ?"
+    ev_params: list[object] = [root_id]
+    if branch_id is not None:
+        ev_sql += " AND branch_id = ?"
+        ev_params.append(branch_id)
+    ev_sql += " ORDER BY id"
+    for event in conn.execute(ev_sql, ev_params):
         stats["events"] += 1
         ops: list[str] = []
         for d in dbm.deltas_for(conn, int(event["id"])):

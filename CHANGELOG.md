@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.9 — 2026-07-14
+
+### Added — alternate timelines (branching)
+- **`chronx fork <name> [--at <moment>]`** — fork a new timeline off the
+  current one and switch to it; new commands record on the new branch. Fork
+  from the past with `--at` to explore an alternate history.
+- **`chronx switch <name>`** — switch timelines, reconstructing the working
+  tree to that branch's tip. Both timelines are kept and fully isolated.
+- **`chronx branches`** — list a directory's timelines (active marker, tip
+  time, fork point). **`chronx branch-delete <name>`** removes one.
+- Recording, `log`, `diff last`, `blame`, `undo`, `rollback`, `bisect`, and
+  `to-git` are now timeline-aware: they operate on the active branch.
+
+### Internal
+- Schema v2 with an automatic, idempotent migration: existing single-timeline
+  stores get a `main` branch and an immutable baseline snapshot; behavior is
+  unchanged until you fork. Branch state is reconstructed as base-snapshot +
+  forward delta replay, so any timeline can be materialized from any point.
+
 ## 0.1.8 — 2026-07-14
 
 ### Added

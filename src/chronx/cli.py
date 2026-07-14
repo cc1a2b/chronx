@@ -69,11 +69,41 @@ def _paths() -> Paths:
     return Paths.from_env()
 
 
+def _ensure_schema(paths: Paths) -> None:
+    """Migrate a pre-branch store so read-only commands see the new schema."""
+    try:
+        ro = dbm.connect(paths.db, readonly=True)
+    except sqlite3.Error:
+        return
+    try:
+        try:
+            row = ro.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            needs = row is None or int(row["value"]) < dbm.SCHEMA_VERSION
+        except sqlite3.OperationalError:
+            needs = True
+    finally:
+        ro.close()
+    if not needs:
+        return
+    try:
+        conn = dbm.connect(paths.db)
+    except sqlite3.Error:
+        return
+    try:
+        dbm.init_db(conn)
+    finally:
+        conn.close()
+
+
 def _open_db(paths: Paths, *, readonly: bool = True) -> sqlite3.Connection:
     if not paths.db.exists():
         raise click.ClickException(
             f"no chronx store at {paths.home} — run `chronx init` first"
         )
+    if readonly:
+        _ensure_schema(paths)
     conn = dbm.connect(paths.db, readonly=readonly)
     if not readonly:
         dbm.init_db(conn)
@@ -514,12 +544,15 @@ def log_cmd(limit: int, all_roots: bool, changes_only: bool, session: str | None
     conn = _open_db(paths)
     try:
         root_id = None
+        branch_id = None
         if not all_roots:
             root = dbm.root_for_path(conn, Path.cwd())
             root_id = int(root["id"]) if root is not None else None
+            if root_id is not None and session is None:
+                branch_id = dbm.active_branch_id(conn, root_id)
         rows = dbm.recent_events(
             conn, root_id=root_id, limit=limit, changes_only=changes_only,
-            session=session,
+            session=session, branch_id=branch_id,
         )
         if not rows:
             click.echo("no events recorded" + ("" if all_roots else " for this directory"))
@@ -1036,6 +1069,148 @@ def rerun(event_id: int, pristine: bool, yes: bool) -> None:
         color = "green" if rc == 0 else "red"
         click.secho(f"command exited {rc} (recorded; see `chronx log`)", fg=color)
         raise click.exceptions.Exit(rc)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- timelines
+
+
+def _require_stopped_clean(paths: Paths, conn: sqlite3.Connection, action: str) -> Path:
+    """Shared precondition for switching timelines: daemon down, tree clean."""
+    from .snapshot import working_changes
+
+    pid = daemonmod.daemon_pid(paths)
+    if pid is not None:
+        raise click.ClickException(
+            f"daemon is running (pid {pid}) — stop it first: chronx daemon stop\n"
+            f"({action} rewrites the working tree, which the daemon would record)"
+        )
+    root = dbm.root_for_path(conn, Path.cwd())
+    if root is None:
+        raise click.ClickException(f"{Path.cwd()} is not inside any tracked directory")
+    drift = working_changes(
+        Path(root["path"]), dbm.load_manifest(conn, int(root["id"])), Config.load(paths)
+    )
+    if drift:
+        raise click.ClickException(
+            f"working tree has {len(drift)} unrecorded change(s) (see `chronx status`) "
+            f"— record or discard them before {action}"
+        )
+    return Path(root["path"])
+
+
+@main.command()
+@click.argument("name")
+@click.option("--at", "-t", default=None,
+              help="Fork at a past moment (mark/time/event) instead of now.")
+def fork(name: str, at: str | None) -> None:
+    """Fork a new timeline from the current one and switch to it.
+
+    Experiment freely: `chronx fork try-rewrite`, hack away, then
+    `chronx switch main` to return — both timelines are kept and isolated.
+    Fork from the past with `--at` to explore an alternate history.
+    """
+    from .ops import fork_branch
+
+    paths = _paths()
+    conn = _open_db(paths, readonly=False)
+    store = ObjectStore(paths.objects)
+    try:
+        _require_stopped_clean(paths, conn, "forking")
+        try:
+            result = fork_branch(
+                conn, store, paths, Path.cwd(), name,
+                at_ts=_parse_at(at) if at else None,
+            )
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"forked timeline {name!r} at {fmt_ts(result.at)}", fg="green")
+        if result.files_changed:
+            click.echo(f"  reconstructed {result.files_changed} file(s) to the fork point")
+        click.secho(f"  now recording on {name!r}; `chronx switch main` to go back", dim=True)
+    finally:
+        conn.close()
+
+
+@main.command()
+@click.argument("name")
+def switch(name: str) -> None:
+    """Switch to another timeline, reconstructing the working tree to its tip."""
+    from .ops import switch_branch
+
+    paths = _paths()
+    conn = _open_db(paths, readonly=False)
+    store = ObjectStore(paths.objects)
+    try:
+        _require_stopped_clean(paths, conn, "switching")
+        try:
+            result = switch_branch(conn, store, paths, Path.cwd(), name)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"switched to {name!r}", fg="green")
+        if result.files_changed:
+            click.echo(f"  reconstructed {result.files_changed} file(s)")
+    finally:
+        conn.close()
+
+
+@main.command(name="branches")
+def branches_cmd() -> None:
+    """List the timelines for this directory."""
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        root = dbm.root_for_path(conn, Path.cwd())
+        if root is None:
+            raise click.ClickException(f"{Path.cwd()} is not inside any tracked directory")
+        active = dbm.active_branch_id(conn, int(root["id"]))
+        rows = dbm.list_branches(conn, int(root["id"]))
+        if not rows:
+            click.echo("no timelines yet")
+            return
+        for b in rows:
+            mark = "*" if int(b["id"]) == active else " "
+            tip = fmt_ts(b["tip_ts"]) if b["tip_ts"] else "(no commands yet)"
+            parent = ""
+            if b["parent_branch_id"]:
+                p = dbm.get_branch(conn, int(b["parent_branch_id"]))
+                parent = f"  forked from {p['name']!r} @ {fmt_ts(b['base_ts'])}" if p else ""
+            colored = click.style(b["name"], fg="green" if mark == "*" else None,
+                                  bold=mark == "*")
+            click.echo(f" {mark} {colored}  {b['events']} cmd(s), tip {tip}{parent}")
+    finally:
+        conn.close()
+
+
+@main.command()
+@click.argument("name")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def branch_delete(name: str, yes: bool) -> None:
+    """Delete a timeline and all of its recorded events (not the active one)."""
+    paths = _paths()
+    conn = _open_db(paths, readonly=False)
+    try:
+        root = dbm.root_for_path(conn, Path.cwd())
+        if root is None:
+            raise click.ClickException(f"{Path.cwd()} is not inside any tracked directory")
+        branch = dbm.branch_by_name(conn, int(root["id"]), name)
+        if branch is None:
+            raise click.ClickException(f"no timeline named {name!r}")
+        if int(branch["id"]) == dbm.active_branch_id(conn, int(root["id"])):
+            raise click.ClickException(
+                f"{name!r} is the active timeline — `chronx switch` away first"
+            )
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE branch_id = ?", (branch["id"],)
+        ).fetchone()["n"]
+        if not yes and not click.confirm(
+            f"Delete timeline {name!r} and its {n} event(s)?", default=False
+        ):
+            click.echo("aborted")
+            return
+        events, _ = dbm.delete_branch(conn, int(branch["id"]))
+        click.secho(f"deleted timeline {name!r} ({events} event(s))", fg="green")
     finally:
         conn.close()
 

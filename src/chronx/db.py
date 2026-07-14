@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .store import HASH_ALGO
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -30,9 +30,27 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS roots (
-    id       INTEGER PRIMARY KEY,
-    path     TEXT NOT NULL UNIQUE,
-    added_at REAL NOT NULL
+    id               INTEGER PRIMARY KEY,
+    path             TEXT NOT NULL UNIQUE,
+    added_at         REAL NOT NULL,
+    active_branch_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS branches (
+    id               INTEGER PRIMARY KEY,
+    root_id          INTEGER NOT NULL REFERENCES roots(id),
+    name             TEXT NOT NULL,
+    parent_branch_id INTEGER,
+    base_ts          REAL NOT NULL,
+    created_at       REAL NOT NULL,
+    UNIQUE (root_id, name)
+);
+CREATE TABLE IF NOT EXISTS root_baseline (
+    root_id INTEGER NOT NULL REFERENCES roots(id),
+    path    TEXT NOT NULL,
+    hash    TEXT NOT NULL,
+    size    INTEGER NOT NULL,
+    mode    INTEGER NOT NULL,
+    PRIMARY KEY (root_id, path)
 );
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +60,8 @@ CREATE TABLE IF NOT EXISTS events (
     command     TEXT,
     started_at  REAL NOT NULL,
     finished_at REAL,
-    exit_code   INTEGER
+    exit_code   INTEGER,
+    branch_id   INTEGER
 );
 CREATE TABLE IF NOT EXISTS deltas (
     id          INTEGER PRIMARY KEY,
@@ -76,6 +95,8 @@ CREATE INDEX IF NOT EXISTS idx_events_root_time ON events(root_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_deltas_event ON deltas(event_id);
 CREATE INDEX IF NOT EXISTS idx_deltas_path ON deltas(path);
 """
+# idx_events_branch is created in _migrate_branches, after ensuring the
+# branch_id column exists (an old events table won't have it yet).
 
 EXTERNAL_COMMAND = None  # events.command for changes not caused by a shell command
 
@@ -131,6 +152,79 @@ def init_db(conn: sqlite3.Connection) -> None:
                 f"store was created with {row['value']!r} but this install hashes "
                 f"with {HASH_ALGO!r}; delete the store or install the matching extra"
             )
+        _migrate_branches(conn)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
+            " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _compute_baseline(
+    conn: sqlite3.Connection, root_id: int
+) -> list[tuple[str, str, int, int]]:
+    """The tree state at tracking start, for an existing (pre-branch) root.
+
+    Seeds from the current manifest (latest == baseline for unchanged files),
+    then rewinds every changed path to the content before its first delta.
+    Returns (path, hash, size, mode) rows; absent-at-baseline paths are omitted.
+    """
+    state: dict[str, tuple[str, int, int]] = {
+        r["path"]: (r["hash"], r["size"], r["mode"])
+        for r in conn.execute(
+            "SELECT path, hash, size, mode FROM manifest WHERE root_id = ?", (root_id,)
+        )
+    }
+    for r in conn.execute(
+        "SELECT d.path AS path, d.before_hash AS bh, d.before_size AS bs,"
+        " d.before_mode AS bm, MIN(e.id) AS first_id"
+        " FROM deltas d JOIN events e ON e.id = d.event_id"
+        " WHERE e.root_id = ? GROUP BY d.path",
+        (root_id,),
+    ):
+        if r["bh"] is None:
+            state.pop(r["path"], None)  # created after baseline
+        else:
+            state[r["path"]] = (r["bh"], r["bs"] or 0, r["bm"] or 0o644)
+    return [(p, h, s, m) for p, (h, s, m) in state.items()]
+
+
+def _migrate_branches(conn: sqlite3.Connection) -> None:
+    """Idempotently bring a pre-branch store up to the branching schema."""
+    if "branch_id" not in _columns(conn, "events"):
+        conn.execute("ALTER TABLE events ADD COLUMN branch_id INTEGER")
+    if "active_branch_id" not in _columns(conn, "roots"):
+        conn.execute("ALTER TABLE roots ADD COLUMN active_branch_id INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_branch ON events(branch_id)")
+
+    for root in conn.execute(
+        "SELECT * FROM roots WHERE active_branch_id IS NULL"
+    ).fetchall():
+        root_id = int(root["id"])
+        cur = conn.execute(
+            "INSERT INTO branches (root_id, name, parent_branch_id, base_ts, created_at)"
+            " VALUES (?, 'main', NULL, ?, ?)",
+            (root_id, root["added_at"], time.time()),
+        )
+        main_id = int(cur.lastrowid)  # type: ignore[arg-type]
+        conn.execute(
+            "UPDATE events SET branch_id = ? WHERE root_id = ? AND branch_id IS NULL",
+            (main_id, root_id),
+        )
+        conn.execute(
+            "UPDATE roots SET active_branch_id = ? WHERE id = ?", (main_id, root_id)
+        )
+        baseline = _compute_baseline(conn, root_id)
+        if baseline:
+            conn.executemany(
+                "INSERT OR IGNORE INTO root_baseline (root_id, path, hash, size, mode)"
+                " VALUES (?, ?, ?, ?, ?)",
+                [(root_id, p, h, s, m) for p, h, s, m in baseline],
+            )
 
 
 # --- roots -----------------------------------------------------------------
@@ -162,6 +256,125 @@ def root_for_path(conn: sqlite3.Connection, path: Path) -> sqlite3.Row | None:
             if best is None or len(str(root)) > len(str(best["path"])):
                 best = row
     return best
+
+
+# --- branches ----------------------------------------------------------------
+
+
+def set_root_baseline(
+    conn: sqlite3.Connection, root_id: int, entries: dict[str, "ManifestEntry"]
+) -> None:
+    """Record the immutable tree state at tracking start (caller-transacted)."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO root_baseline (root_id, path, hash, size, mode)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [(root_id, p, e.hash, e.size, e.mode) for p, e in entries.items()],
+    )
+
+
+def root_baseline(conn: sqlite3.Connection, root_id: int) -> dict[str, tuple[str, int]]:
+    """Baseline state: path -> (hash, mode)."""
+    return {
+        r["path"]: (r["hash"], r["mode"])
+        for r in conn.execute(
+            "SELECT path, hash, mode FROM root_baseline WHERE root_id = ?", (root_id,)
+        )
+    }
+
+
+def create_branch(
+    conn: sqlite3.Connection,
+    root_id: int,
+    name: str,
+    *,
+    parent_branch_id: int | None,
+    base_ts: float,
+) -> int:
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO branches (root_id, name, parent_branch_id, base_ts, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (root_id, name, parent_branch_id, base_ts, time.time()),
+        )
+    return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def get_branch(conn: sqlite3.Connection, branch_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM branches WHERE id = ?", (branch_id,)).fetchone()
+
+
+def branch_by_name(
+    conn: sqlite3.Connection, root_id: int, name: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM branches WHERE root_id = ? AND name = ?", (root_id, name)
+    ).fetchone()
+
+
+def list_branches(conn: sqlite3.Connection, root_id: int) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT b.*,"
+            " (SELECT COUNT(*) FROM events e WHERE e.branch_id = b.id) AS events,"
+            " (SELECT MAX(e.started_at) FROM events e WHERE e.branch_id = b.id) AS tip_ts"
+            " FROM branches b WHERE b.root_id = ? ORDER BY b.created_at",
+            (root_id,),
+        )
+    )
+
+
+def active_branch(conn: sqlite3.Connection, root_id: int) -> sqlite3.Row | None:
+    try:
+        row = conn.execute(
+            "SELECT active_branch_id FROM roots WHERE id = ?", (root_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # pre-migration store opened read-only
+    if row is None or row["active_branch_id"] is None:
+        return None
+    return get_branch(conn, int(row["active_branch_id"]))
+
+
+def active_branch_id(conn: sqlite3.Connection, root_id: int) -> int | None:
+    b = active_branch(conn, root_id)
+    return int(b["id"]) if b is not None else None
+
+
+def set_active_branch(conn: sqlite3.Connection, root_id: int, branch_id: int) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE roots SET active_branch_id = ? WHERE id = ?", (branch_id, root_id)
+        )
+
+
+def delete_branch(conn: sqlite3.Connection, branch_id: int) -> tuple[int, int]:
+    """Delete a branch and its events/deltas. Returns (events, deltas)."""
+    with conn:
+        deltas = conn.execute(
+            "DELETE FROM deltas WHERE event_id IN"
+            " (SELECT id FROM events WHERE branch_id = ?)",
+            (branch_id,),
+        ).rowcount
+        events = conn.execute(
+            "DELETE FROM events WHERE branch_id = ?", (branch_id,)
+        ).rowcount
+        conn.execute("DELETE FROM branches WHERE id = ?", (branch_id,))
+    return events, deltas
+
+
+def branch_deltas_ordered(
+    conn: sqlite3.Connection, branch_id: int, ts: float
+) -> list[sqlite3.Row]:
+    """This branch's own deltas up to `ts`, in event order (for replay)."""
+    return list(
+        conn.execute(
+            "SELECT d.path AS path, d.after_hash AS after_hash, d.after_mode AS after_mode"
+            " FROM deltas d JOIN events e ON e.id = d.event_id"
+            " WHERE e.branch_id = ? AND e.started_at <= ?"
+            " ORDER BY e.id",
+            (branch_id, ts),
+        )
+    )
 
 
 # --- manifest ---------------------------------------------------------------
@@ -215,13 +428,17 @@ def record_event(
     deltas: list[Delta],
     manifest_updates: dict[str, ManifestEntry] | None = None,
     manifest_deletes: set[str] | None = None,
+    branch_id: int | None = None,
 ) -> int:
     """Insert an event, its deltas, and manifest changes in one transaction."""
+    if branch_id is None:
+        branch_id = active_branch_id(conn, root_id)
     with conn:
         cur = conn.execute(
             "INSERT INTO events (session, root_id, cwd, command, started_at,"
-            " finished_at, exit_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (session, root_id, cwd, command, started_at, finished_at, exit_code),
+            " finished_at, exit_code, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (session, root_id, cwd, command, started_at, finished_at, exit_code,
+             branch_id),
         )
         event_id = int(cur.lastrowid)  # type: ignore[arg-type]
         if deltas:
@@ -296,6 +513,7 @@ def last_event(
     *,
     root_id: int | None = None,
     with_deltas_only: bool = False,
+    branch_id: int | None = None,
 ) -> sqlite3.Row | None:
     sql = "SELECT e.* FROM events e"
     where: list[str] = []
@@ -305,6 +523,9 @@ def last_event(
     if root_id is not None:
         where.append("e.root_id = ?")
         params.append(root_id)
+    if branch_id is not None:
+        where.append("e.branch_id = ?")
+        params.append(branch_id)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY e.id DESC LIMIT 1"
@@ -312,22 +533,37 @@ def last_event(
 
 
 def event_at(
-    conn: sqlite3.Connection, ts: float, *, root_id: int | None = None
+    conn: sqlite3.Connection, ts: float, *, root_id: int | None = None,
+    branch_id: int | None = None,
 ) -> sqlite3.Row | None:
     """Latest event started at or before `ts` (else the earliest event)."""
-    scope = "" if root_id is None else " AND root_id = ?"
-    params: list[object] = [ts] + ([root_id] if root_id is not None else [])
+    where = ["started_at <= ?"]
+    params: list[object] = [ts]
+    if root_id is not None:
+        where.append("root_id = ?")
+        params.append(root_id)
+    if branch_id is not None:
+        where.append("branch_id = ?")
+        params.append(branch_id)
     row = conn.execute(
-        f"SELECT * FROM events WHERE started_at <= ?{scope}"
+        f"SELECT * FROM events WHERE {' AND '.join(where)}"
         " ORDER BY started_at DESC, id DESC LIMIT 1",
         params,
     ).fetchone()
     if row is not None:
         return row
-    scope = "" if root_id is None else " WHERE root_id = ?"
+    scope: list[str] = []
+    sparams: list[object] = []
+    if root_id is not None:
+        scope.append("root_id = ?")
+        sparams.append(root_id)
+    if branch_id is not None:
+        scope.append("branch_id = ?")
+        sparams.append(branch_id)
+    clause = (" WHERE " + " AND ".join(scope)) if scope else ""
     return conn.execute(
-        f"SELECT * FROM events{scope} ORDER BY started_at ASC, id ASC LIMIT 1",
-        [root_id] if root_id is not None else [],
+        f"SELECT * FROM events{clause} ORDER BY started_at ASC, id ASC LIMIT 1",
+        sparams,
     ).fetchone()
 
 
@@ -338,6 +574,7 @@ def recent_events(
     limit: int = 500,
     changes_only: bool = False,
     session: str | None = None,
+    branch_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """Most recent events, returned oldest-first (timeline order)."""
     where: list[str] = []
@@ -345,6 +582,9 @@ def recent_events(
     if root_id is not None:
         where.append("root_id = ?")
         params.append(root_id)
+    if branch_id is not None:
+        where.append("branch_id = ?")
+        params.append(branch_id)
     if changes_only:
         where.append("EXISTS (SELECT 1 FROM deltas d WHERE d.event_id = events.id)")
     if session is not None:
@@ -371,6 +611,7 @@ def events_between(
     session: str | None = None,
     changes_only: bool = False,
     limit: int = 2000,
+    branch_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """Events in a time window, oldest-first."""
     where: list[str] = []
@@ -384,6 +625,9 @@ def events_between(
     if root_id is not None:
         where.append("root_id = ?")
         params.append(root_id)
+    if branch_id is not None:
+        where.append("branch_id = ?")
+        params.append(branch_id)
     if session is not None:
         where.append("session = ?")
         params.append(session)
@@ -404,6 +648,7 @@ def events_after(
     *,
     root_id: int | None = None,
     changes_only: bool = False,
+    branch_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """Events newer than a given id, oldest-first (for live tailing)."""
     where = ["id > ?"]
@@ -411,6 +656,9 @@ def events_after(
     if root_id is not None:
         where.append("root_id = ?")
         params.append(root_id)
+    if branch_id is not None:
+        where.append("branch_id = ?")
+        params.append(branch_id)
     if changes_only:
         where.append("EXISTS (SELECT 1 FROM deltas d WHERE d.event_id = events.id)")
     return list(
@@ -577,6 +825,7 @@ def paths_changed_since(
     ts: float,
     *,
     path_prefix: str | None = None,
+    branch_id: int | None = None,
 ) -> list[str]:
     """Every path touched by an event after `ts` (they may differ from state@ts)."""
     sql = (
@@ -584,6 +833,9 @@ def paths_changed_since(
         " WHERE e.root_id = ? AND e.started_at > ?"
     )
     params: list[object] = [root_id, ts]
+    if branch_id is not None:
+        sql += " AND e.branch_id = ?"
+        params.append(branch_id)
     if path_prefix:
         sql += " AND (d.path = ? OR d.path LIKE ? ESCAPE '\\')"
         params += [path_prefix, _like_escape(path_prefix) + "/%"]
@@ -591,16 +843,20 @@ def paths_changed_since(
 
 
 def first_delta_after(
-    conn: sqlite3.Connection, root_id: int, path: str, ts: float
+    conn: sqlite3.Connection, root_id: int, path: str, ts: float,
+    *, branch_id: int | None = None,
 ) -> sqlite3.Row | None:
     """The earliest delta touching `path` after `ts`; its before_* fields are
     exactly the file's state at `ts`."""
-    return conn.execute(
+    sql = (
         "SELECT d.* FROM deltas d JOIN events e ON e.id = d.event_id"
         " WHERE e.root_id = ? AND d.path = ? AND e.started_at > ?"
-        " ORDER BY e.id ASC LIMIT 1",
-        (root_id, path, ts),
-    ).fetchone()
+    )
+    params: list[object] = [root_id, path, ts]
+    if branch_id is not None:
+        sql += " AND e.branch_id = ?"
+        params.append(branch_id)
+    return conn.execute(sql + " ORDER BY e.id ASC LIMIT 1", params).fetchone()
 
 
 # --- search ------------------------------------------------------------------
@@ -643,16 +899,22 @@ def referenced_hashes(conn: sqlite3.Connection) -> set[str]:
 
 
 def events_touching(
-    conn: sqlite3.Connection, root_id: int, rel_path: str
+    conn: sqlite3.Connection, root_id: int, rel_path: str,
+    *, branch_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """Events whose deltas include this path, newest first, with change kind."""
+    where = "e.root_id = ? AND d.path = ?"
+    params: list[object] = [root_id, rel_path]
+    if branch_id is not None:
+        where += " AND e.branch_id = ?"
+        params.append(branch_id)
     return list(
         conn.execute(
             "SELECT e.*, d.change AS change, d.before_hash AS before_hash,"
             " d.after_hash AS after_hash"
             " FROM deltas d JOIN events e ON e.id = d.event_id"
-            " WHERE e.root_id = ? AND d.path = ?"
+            f" WHERE {where}"
             " ORDER BY e.id DESC",
-            (root_id, rel_path),
+            params,
         )
     )

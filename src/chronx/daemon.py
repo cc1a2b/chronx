@@ -168,6 +168,14 @@ class Daemon:
                 return None
             with self.conn:
                 dbm.apply_manifest(self.conn, root_id, manifest, set())
+                dbm.set_root_baseline(self.conn, root_id, manifest)
+            main_id = dbm.create_branch(
+                self.conn, root_id, "main", parent_branch_id=None,
+                base_ts=float(self.conn.execute(
+                    "SELECT added_at FROM roots WHERE id = ?", (root_id,)
+                ).fetchone()["added_at"]),
+            )
+            dbm.set_active_branch(self.conn, root_id, main_id)
             log.info("baseline complete: %d files", len(manifest))
         else:
             manifest = dbm.load_manifest(self.conn, root_id)
