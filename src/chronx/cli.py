@@ -1792,6 +1792,75 @@ def export_cmd(output: Path | None, root_path: Path | None) -> None:
         conn.close()
 
 
+@main.command()
+@click.argument("url")
+@click.option("--root", "remote_root", type=int, default=None,
+              help="Which remote root id to pull (default: the server's active root).")
+@click.option("--as", "as_path", type=click.Path(path_type=Path), default=None,
+              help="Attach the pulled history to this local directory.")
+def pull(url: str, remote_root: int | None, as_path: Path | None) -> None:
+    """Pull recorded history from a remote `chronx serve` into the local store.
+
+    Point it at a teammate's server (or your other machine's):
+    `chronx pull http://host:7373 --as .`. Re-pulls are idempotent — only new
+    events are added. The daemon must be stopped.
+    """
+    import json as _json
+    import tempfile
+    import urllib.error
+    import urllib.request
+
+    from .transfer import TransferError, import_archive
+
+    paths = _paths()
+    if not paths.db.exists():
+        raise click.ClickException("run `chronx init` first")
+    pid = daemonmod.daemon_pid(paths)
+    if pid is not None:
+        raise click.ClickException(
+            f"daemon is running (pid {pid}) — stop it first: chronx daemon stop"
+        )
+    base = url.rstrip("/")
+
+    def fetch(path: str, *, binary: bool = False):
+        try:
+            with urllib.request.urlopen(base + path, timeout=30) as resp:
+                return resp.read() if binary else _json.loads(resp.read())
+        except urllib.error.URLError as exc:
+            raise click.ClickException(
+                f"could not reach {base} ({exc}); is `chronx serve` running there?"
+            ) from exc
+
+    summary = fetch("/api/summary")
+    if not summary.get("roots"):
+        raise click.ClickException("the remote server has no recorded roots")
+    root_id = remote_root or summary.get("active_root") or summary["roots"][0]["id"]
+    remote_path = next(
+        (r["path"] for r in summary["roots"] if r["id"] == root_id), "?"
+    )
+    click.echo(f"pulling root {root_id} ({remote_path}) from {base} …")
+
+    blob = fetch(f"/bundle?root={root_id}", binary=True)
+    with tempfile.NamedTemporaryFile(suffix=".chronx", delete=False) as tf:
+        tf.write(blob)
+        tmp = Path(tf.name)
+    try:
+        stats = import_archive(paths, tmp, as_path=as_path, dedup=True)
+    except TransferError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    click.secho(f"pulled into {stats.root}", fg="green")
+    click.echo(
+        f"  +{stats.events} new event(s), {stats.events_skipped} already present, "
+        f"blobs +{stats.blobs_added}"
+    )
+    if stats.remapped:
+        click.secho("  paths remapped to the target directory", dim=True)
+    click.secho("  explore with `chronx log`, `chronx graph`, `chronx diff`", dim=True)
+
+
 @main.command("import")
 @click.argument("archive", type=click.Path(exists=True, path_type=Path))
 @click.option("--as", "as_path", type=click.Path(path_type=Path), default=None,

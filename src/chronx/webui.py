@@ -230,6 +230,44 @@ class _Handler(BaseHTTPRequestHandler):
     def _json(self, obj, status: int = 200) -> None:
         self._send(json.dumps(obj).encode("utf-8"), "application/json", status)
 
+    def _serve_bundle(self, root_id: int | None) -> None:
+        """Stream a .chronx export archive for a root (read-only)."""
+        import tempfile
+        from .transfer import export_root
+
+        conn = self._db()
+        try:
+            if root_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM roots WHERE id = ?", (root_id,)
+                ).fetchone()
+            else:
+                roots = dbm.get_roots(conn)
+                row = roots[0] if roots else None
+            if row is None:
+                self._json({"error": "no such root"}, 404)
+                return
+            with tempfile.NamedTemporaryFile(
+                suffix=".chronx", delete=False, dir=str(self.paths.home)
+            ) as tf:
+                tmp = Path(tf.name)
+            try:
+                export_root(conn, ObjectStore(self.paths.objects), row, tmp)
+                data = tmp.read_bytes()
+            finally:
+                tmp.unlink(missing_ok=True)
+        finally:
+            conn.close()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition", 'attachment; filename="chronx-history.chronx"')
+        self.send_header("X-Chronx-Root", str(row["path"]))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
@@ -249,6 +287,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 self._send(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if path == "/bundle":
+                self._serve_bundle(qi("root"))
                 return
             if not path.startswith("/api/"):
                 self._json({"error": "not found"}, 404)

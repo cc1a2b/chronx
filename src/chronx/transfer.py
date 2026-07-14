@@ -57,6 +57,7 @@ class ImportStats:
     blobs_added: int
     blobs_skipped: int
     remapped: bool
+    events_skipped: int = 0
 
 
 # --------------------------------------------------------------------- export
@@ -160,9 +161,15 @@ def import_archive(
     archive: Path,
     *,
     as_path: Path | None = None,
+    dedup: bool = False,
 ) -> ImportStats:
     """Import an exported archive into the local store. Daemon must be stopped
-    (the caller enforces that)."""
+    (the caller enforces that).
+
+    With `dedup`, events already present on the target root (matched on
+    started_at + command) are skipped, so repeated imports/pulls of the same
+    source are idempotent and effectively incremental.
+    """
     if not archive.is_file():
         raise TransferError(f"{archive} does not exist")
     store = ObjectStore(paths.objects)
@@ -243,9 +250,18 @@ def import_archive(
                     (min(origin_added, earliest), root_id),
                 )
 
-        ev_count = delta_count = 0
+        ev_count = delta_count = skipped_events = 0
         with conn:
             for e in meta["events"]:
+                if dedup:
+                    dup = conn.execute(
+                        "SELECT 1 FROM events WHERE root_id = ? AND started_at = ?"
+                        " AND command IS ? LIMIT 1",
+                        (root_id, e["started_at"], e["command"]),
+                    ).fetchone()
+                    if dup is not None:
+                        skipped_events += 1
+                        continue
                 cwd = _remap_cwd(e["cwd"], old_root, new_root) if remapped else e["cwd"]
                 cur = conn.execute(
                     "INSERT INTO events (session, root_id, cwd, command, started_at,"
@@ -280,6 +296,39 @@ def import_archive(
                      for m in meta["manifest"]],
                 )
 
+            # Establish a 'main' timeline for a freshly-imported root, so
+            # branches/graph/fork work and events are branch-attributed (the
+            # export flattens the source's branches into one local timeline).
+            if dbm.active_branch_id(conn, root_id) is None:
+                added_at = conn.execute(
+                    "SELECT added_at FROM roots WHERE id = ?", (root_id,)
+                ).fetchone()["added_at"]
+                mcur = conn.execute(
+                    "INSERT INTO branches (root_id, name, parent_branch_id, base_ts,"
+                    " created_at) VALUES (?, 'main', NULL, ?, ?)",
+                    (root_id, added_at, time.time()),
+                )
+                main_id = int(mcur.lastrowid)  # type: ignore[arg-type]
+                conn.execute(
+                    "UPDATE events SET branch_id = ? WHERE root_id = ?"
+                    " AND branch_id IS NULL",
+                    (main_id, root_id),
+                )
+                conn.execute(
+                    "UPDATE roots SET active_branch_id = ? WHERE id = ?",
+                    (main_id, root_id),
+                )
+                # True baseline (state before the first event), derived from the
+                # now-inserted manifest + deltas — NOT the imported manifest,
+                # which is the latest state.
+                baseline = dbm._compute_baseline(conn, root_id)
+                if baseline:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO root_baseline"
+                        " (root_id, path, hash, size, mode) VALUES (?, ?, ?, ?, ?)",
+                        [(root_id, p, h, s, m) for p, h, s, m in baseline],
+                    )
+
             marks_added = marks_renamed = 0
             for m in meta.get("marks", []):
                 name = m["name"]
@@ -308,4 +357,5 @@ def import_archive(
         blobs_added=added,
         blobs_skipped=skipped,
         remapped=remapped,
+        events_skipped=skipped_events,
     )

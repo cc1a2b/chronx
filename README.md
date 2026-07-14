@@ -86,6 +86,7 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx report` | Shareable Markdown of a window/session: `chronx report --since 2h --full > session.md`. |
 | `chronx status` | Working-tree changes not yet recorded (drift vs the last snapshot). |
 | `chronx export` / `import` | Move recorded history between machines; `import <a> --as .` re-attaches it here. |
+| `chronx serve` + `chronx pull <url>` | Pull a teammate's recorded session over HTTP (idempotent, incremental). |
 | `chronx to-git <dir>` | Replay your session into a real git repo — one commit per command. |
 | `chronx stats` | Hottest files, noisiest commands, store size. |
 | `chronx doctor` | Diagnose the pipeline: store, db, daemon, fifo, hooks, disk. |
@@ -205,6 +206,27 @@ last one.
   on your next command.
 - Blobs are stored once per unique content (`objects/<blake3[:2]>/<rest>`),
   zlib-compressed. Unchanged files cost nothing, ever.
+
+## Pull a session from another machine
+
+chronx history is networked. On the machine that recorded it:
+
+```sh
+chronx serve --host 0.0.0.0        # expose read-only history
+```
+
+On yours:
+
+```sh
+chronx daemon stop
+chronx pull http://their-host:7373 --as ./debug-repro
+chronx log        # their commands
+chronx graph      # their timelines
+chronx rollback shipped   # reconstruct their tree at any point
+```
+
+Re-pull anytime — only new events are added (idempotent, incremental). The
+server side is strictly read-only; the pull imports into your local store.
 
 ## Turn a session into git history
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2 — 2026-07-14
+
+### Added — networked history
+- **`chronx pull <url>`** — pull recorded history from a remote `chronx serve`
+  into the local store (`chronx pull http://host:7373 --as .`). Re-pulls are
+  idempotent and effectively incremental: events already present (matched on
+  timestamp + command) are skipped; blobs dedup as always.
+- `chronx serve` gained a read-only **`/bundle`** endpoint that streams a
+  `.chronx` export archive for a root (what `pull` fetches). The server stays
+  read-only; the client side reuses the import path with its daemon-stopped
+  guard.
+- `chronx import` learned `dedup` (used by pull) to skip already-present events.
+
 ## 0.2.1 — 2026-07-14
 
 ### Added
