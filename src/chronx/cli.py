@@ -21,6 +21,7 @@ from .ops import (
     OpsError,
     apply_rollback,
     apply_undo,
+    bisect_history,
     blame_file,
     content_at,
     describe_command,
@@ -1035,6 +1036,113 @@ def rerun(event_id: int, pristine: bool, yes: bool) -> None:
         color = "green" if rc == 0 else "red"
         click.secho(f"command exited {rc} (recorded; see `chronx log`)", fg=color)
         raise click.exceptions.Exit(rc)
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ bisect
+
+
+@main.command(context_settings={"ignore_unknown_options": True})
+@click.option("--good", "good_spec", required=True,
+              help="A moment where the test PASSES (mark, event id, time).")
+@click.option("--bad", "bad_spec", default="last", show_default=True,
+              help="A moment where the test FAILS (mark, event id, time).")
+@click.option("--timeout", type=float, default=None,
+              help="Abort if a single test run exceeds this many seconds.")
+@click.option("--no-verify", is_flag=True,
+              help="Skip checking that the endpoints really are good/bad.")
+@click.option("--force", is_flag=True,
+              help="Proceed even if the working tree has unrecorded changes.")
+@click.argument("test", nargs=-1, required=True, type=click.UNPROCESSED)
+def bisect(good_spec: str, bad_spec: str, timeout: float | None,
+           no_verify: bool, force: bool, test: tuple[str, ...]) -> None:
+    """Find the command that broke something, by binary search over history.
+
+    Reconstructs the tree at candidate moments and runs TEST at each (exit 0 =
+    good, non-zero = bad) to pinpoint the first event that made it fail:
+
+        chronx bisect --good shipped -- pytest -x tests/
+
+    The daemon must be stopped and the working tree clean; the tree is
+    reconstructed during the search and restored to its starting state after.
+    """
+    from .snapshot import working_changes
+
+    paths = _paths()
+    pid = daemonmod.daemon_pid(paths)
+    if pid is not None:
+        raise click.ClickException(
+            f"daemon is running (pid {pid}) — stop it first: chronx daemon stop\n"
+            "(bisect reconstructs the working tree, which the daemon would record)"
+        )
+    conn = _open_db(paths, readonly=False)
+    store = ObjectStore(paths.objects)
+    cfg = Config.load(paths)
+    try:
+        root = dbm.root_for_path(conn, Path.cwd())
+        if root is None:
+            raise click.ClickException(
+                f"{Path.cwd()} is not inside any tracked directory"
+            )
+        drift = working_changes(Path(root["path"]), dbm.load_manifest(conn, int(root["id"])), cfg)
+        if drift and not force:
+            raise click.ClickException(
+                f"working tree has {len(drift)} unrecorded change(s) "
+                "(see `chronx status`) — bisect would overwrite them. Record them "
+                "first, or pass --force to discard them."
+            )
+        try:
+            good_ts = _moment_ts(conn, good_spec)
+            bad_ts = (
+                float(resolve_event(conn, "last", Path.cwd())["started_at"])
+                if bad_spec == "last"
+                else _moment_ts(conn, bad_spec)
+            )
+        except (OpsError, click.ClickException) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        click.secho(
+            f"bisecting between {fmt_ts(good_ts)} (good) and {fmt_ts(bad_ts)} (bad)",
+            bold=True,
+        )
+
+        def _on_test(event: sqlite3.Row, good: bool) -> None:
+            verdict = click.style("GOOD", fg="green") if good else click.style("BAD", fg="red")
+            click.echo(f"  {verdict}  #{event['id']:<5} {describe_command(event)}")
+
+        try:
+            result = bisect_history(
+                conn, store, paths, Path.cwd(),
+                good_ts=good_ts, bad_ts=bad_ts, test=list(test),
+                verify=not no_verify, timeout=timeout, on_test=_on_test,
+            )
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        click.echo()
+        click.secho(
+            f"ran {result.tests_run} test(s) over {result.candidates} candidate event(s)",
+            dim=True,
+        )
+        if result.culprit is None:
+            click.secho(
+                "no candidate event failed the test — the regression may predate "
+                "--good, or come from outside the tracked tree",
+                fg="yellow",
+            )
+            return
+        click.echo()
+        click.secho("first bad event (the regression):", bold=True)
+        _echo_event_header(result.culprit)
+        if result.last_good_id is not None:
+            click.secho(f"\nlast good event was #{result.last_good_id}", dim=True)
+        click.secho(
+            f"inspect it with `chronx diff {result.culprit['id']}`, "
+            f"undo it with `chronx undo --event {result.culprit['id']}`",
+            dim=True,
+        )
+        click.secho("(working tree restored to its starting state)", dim=True)
     finally:
         conn.close()
 

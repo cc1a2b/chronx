@@ -73,6 +73,7 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx restore <file>` | Put a single file back to its state at any moment (reversible, confirmed). |
 | `chronx undo` | Revert the working dir to its state before the last command. |
 | `chronx rollback <moment>` | Revert the **whole tree** to a mark, time, or event — one reversible event. |
+| `chronx bisect --good <m> -- <test>` | Binary-search history for the command that broke your test. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |
@@ -106,6 +107,24 @@ reverts the rollback itself. `--path src/` limits the blast radius,
 chronx search 'pip install'        # grep your command history + effects
 chronx search -S 'timeout *= *30'  # pickaxe: which command changed this line?
 ```
+
+When you know *what* broke but not *which command* did it, let chronx find it
+automatically — binary search over history, running your test at each step:
+
+```sh
+chronx daemon stop                 # bisect drives the tree itself
+chronx bisect --good shipped -- pytest -x tests/test_api.py
+#   GOOD  #41  ./refactor.sh
+#   BAD   #47  ./optimize-queries.sh
+#   ...
+#   first bad event (the regression):
+#   event #45  $ sed -i 's/LIMIT 100/LIMIT 10/' query.sql
+```
+
+chronx reconstructs the tree at each candidate moment from recorded blobs,
+runs the test, and restores your starting state when done. `--good` is a
+moment the test passed (a mark, event id, or time); `--bad` defaults to the
+latest event.
 
 ### Single-file time travel
 

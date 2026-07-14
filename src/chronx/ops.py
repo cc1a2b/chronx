@@ -655,6 +655,227 @@ def apply_rollback(
     return event_id, len(deltas)
 
 
+# ------------------------------------------------------------------ bisect
+
+
+@dataclass(frozen=True)
+class BisectStep:
+    event_id: int
+    command: str
+    started_at: float
+    good: bool
+
+
+@dataclass(frozen=True)
+class BisectResult:
+    culprit: sqlite3.Row | None  # first bad event (the regression), or None
+    last_good_id: int | None
+    candidates: int
+    tests_run: int
+    steps: list[BisectStep]
+
+
+def state_at(
+    conn: sqlite3.Connection, root_id: int, ts: float
+) -> dict[str, tuple[str | None, int | None]]:
+    """The full recorded content of every tracked file at time `ts`.
+
+    Returns rel_path -> (blob_hash, mode); a hash of None means the file did
+    not exist at that moment. Independent of current disk state, so it can
+    materialize any historical point (not just "revert from latest").
+    """
+    from itertools import groupby
+
+    state: dict[str, tuple[str | None, int | None]] = {}
+    # Files that never changed sit at their baseline (still in the manifest).
+    for row in conn.execute(
+        "SELECT path, hash, mode FROM manifest WHERE root_id = ?", (root_id,)
+    ):
+        state[row["path"]] = (row["hash"], row["mode"])
+
+    rows = conn.execute(
+        "SELECT d.path AS path, d.after_hash AS after_hash, d.after_mode AS after_mode,"
+        " d.before_hash AS before_hash, d.before_mode AS before_mode,"
+        " e.started_at AS started_at"
+        " FROM deltas d JOIN events e ON e.id = d.event_id"
+        " WHERE e.root_id = ? ORDER BY d.path, e.id",
+        (root_id,),
+    )
+    for path, group in groupby(rows, key=lambda r: r["path"]):
+        history = list(group)
+        at_or_before = [r for r in history if r["started_at"] <= ts]
+        if at_or_before:
+            last = at_or_before[-1]
+            state[path] = (last["after_hash"], last["after_mode"])
+        else:
+            first = history[0]  # state before the first-ever change = baseline
+            state[path] = (first["before_hash"], first["before_mode"])
+    return state
+
+
+def reconstruct_to(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    cwd: Path,
+    ts: float,
+    label: str,
+) -> Path:
+    """Silently rewrite the working tree to its FULL recorded state at `ts`.
+
+    Records no event and sends no sync — a throwaway reconstruction for bisect,
+    which restores the original state when done. Works from any current disk
+    state (bisect jumps around), so it materializes the complete tree at `ts`
+    rather than diffing against 'latest'. Requires the daemon stopped.
+    """
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root = Path(root_row["path"])
+    desired = state_at(conn, int(root_row["id"]), ts)
+
+    missing = [
+        rel for rel, (h, _m) in desired.items()
+        if h is not None and not store.has(h)
+    ]
+    if missing:
+        raise OpsError(
+            f"cannot reconstruct {label}: {len(missing)} file(s) have missing "
+            f"blobs (first: {missing[0]}); run `chronx fsck`"
+        )
+
+    for rel, (target_hash, target_mode) in desired.items():
+        full = root / rel
+        if target_hash is None:
+            try:
+                full.unlink(missing_ok=True)
+            except OSError as exc:
+                raise OpsError(f"could not remove {rel}: {exc}") from exc
+            continue
+        data, st = _current_state(full)
+        if st is not None and data is not None and hash_bytes(data) == target_hash:
+            continue  # already correct on disk
+        try:
+            _write_atomic(full, store.get(target_hash), target_mode)
+        except OSError as exc:
+            raise OpsError(f"could not restore {rel}: {exc}") from exc
+    return root
+
+
+def _run_test(command: list[str], cwd: Path, timeout: float | None) -> int:
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    argv = [shell, "-c", shlex.join(command)]
+    try:
+        return subprocess.run(argv, cwd=str(cwd), timeout=timeout).returncode
+    except subprocess.TimeoutExpired as exc:
+        raise OpsError(
+            f"test command timed out after {timeout:g}s; raise --timeout or make "
+            "the test terminate"
+        ) from exc
+
+
+def bisect_history(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    cwd: Path,
+    *,
+    good_ts: float,
+    bad_ts: float,
+    test: list[str],
+    verify: bool = True,
+    timeout: float | None = None,
+    on_test=None,
+) -> BisectResult:
+    """Binary-search the file-changing events in (good_ts, bad_ts] for the
+    first one whose resulting tree state fails `test` (exit != 0).
+
+    The working tree is reconstructed to each candidate state to run the test,
+    then restored to the bad (starting) state on the way out.
+    """
+    if bad_ts <= good_ts:
+        raise OpsError("the good moment must be earlier than the bad moment")
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root_id = int(root_row["id"])
+
+    candidates = [
+        e
+        for e in dbm.events_between(
+            conn, since=good_ts, until=bad_ts, root_id=root_id, changes_only=True
+        )
+        if float(e["started_at"]) > good_ts
+    ]
+    if not candidates:
+        raise OpsError(
+            "no file-changing events between the good and bad moments — "
+            "nothing could have changed the outcome"
+        )
+
+    steps: list[BisectStep] = []
+    tests = 0
+
+    def test_at(event: sqlite3.Row) -> bool:
+        nonlocal tests
+        reconstruct_to(
+            conn, store, cwd, float(event["started_at"]), f"event #{event['id']}"
+        )
+        rc = _run_test(test, cwd, timeout)
+        tests += 1
+        good = rc == 0
+        steps.append(
+            BisectStep(int(event["id"]), describe_command(event),
+                       float(event["started_at"]), good)
+        )
+        if on_test is not None:
+            on_test(event, good)
+        return good
+
+    try:
+        if verify:
+            # Endpoints must actually be good/bad or the search is meaningless.
+            reconstruct_to(conn, store, cwd, good_ts, "the good moment")
+            if _run_test(test, cwd, timeout) != 0:
+                raise OpsError("the test FAILS at the good moment; pick an earlier "
+                               "--good or fix the test")
+            tests += 1
+            reconstruct_to(conn, store, cwd, bad_ts, "the bad moment")
+            if _run_test(test, cwd, timeout) == 0:
+                raise OpsError("the test PASSES at the bad moment; pick a later "
+                               "--bad — the regression isn't in this window")
+            tests += 1
+
+        lo, hi = 0, len(candidates) - 1
+        first_bad: int | None = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if test_at(candidates[mid]):
+                lo = mid + 1
+            else:
+                first_bad = mid
+                hi = mid - 1
+
+        culprit = candidates[first_bad] if first_bad is not None else None
+        last_good_id = (
+            int(candidates[first_bad - 1]["id"])
+            if first_bad is not None and first_bad > 0
+            else None
+        )
+        return BisectResult(
+            culprit=culprit,
+            last_good_id=last_good_id,
+            candidates=len(candidates),
+            tests_run=tests,
+            steps=steps,
+        )
+    finally:
+        # Always leave the tree where we found it (the bad/starting state).
+        try:
+            reconstruct_to(conn, store, cwd, bad_ts, "the starting state")
+        except OpsError:
+            pass
+
+
 # ---------------------------------------------------------------- range diff
 
 

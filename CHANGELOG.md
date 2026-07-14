@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.6 — 2026-07-14
+
+### Added
+- **`chronx bisect --good <moment> -- <test>`** — find the command that broke
+  something, by binary search over recorded history. chronx reconstructs the
+  working tree at each candidate moment (reusing the rollback engine), runs
+  your test command there (exit 0 = good, non-zero = bad), and pinpoints the
+  first event whose changes made it fail — `git bisect run`, but over shell
+  history. Verifies the endpoints, restores the tree to its starting state
+  afterwards, and requires a stopped daemon + clean tree (like git bisect).
+
 ## 0.1.5 — 2026-07-13
 
 ### Added
