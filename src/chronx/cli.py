@@ -1229,6 +1229,63 @@ def merge(other: str, allow_conflicts: bool, dry_run: bool, yes: bool) -> None:
         conn.close()
 
 
+@main.command()
+@click.option("--limit", "-n", default=200, show_default=True,
+              help="How many recent events to graph.")
+def graph(limit: int) -> None:
+    """Draw the timeline graph across all branches (like git log --graph)."""
+    from .graphview import LANE_COLORS, _NODE, build_graph
+
+    paths = _paths()
+    conn = _open_db(paths)
+    try:
+        root = dbm.root_for_path(conn, Path.cwd())
+        if root is None:
+            raise click.ClickException(f"{Path.cwd()} is not inside any tracked directory")
+        g = build_graph(conn, int(root["id"]), limit=limit)
+        active = dbm.active_branch_id(conn, int(root["id"]))
+        # Legend: lane color per branch.
+        legend = []
+        for i, name in enumerate(g.branch_names):
+            col = LANE_COLORS[i % len(LANE_COLORS)]
+            legend.append(click.style(f"●{name}", fg=col))
+        click.echo("timelines: " + "  ".join(legend))
+        click.echo()
+        if not g.rows:
+            click.echo("(no events yet)")
+            return
+        for r in g.rows:
+            cells = []
+            for col, live in enumerate(r.lanes):
+                color = LANE_COLORS[col % len(LANE_COLORS)]
+                if col == r.node_lane:
+                    node = _NODE[r.kind]
+                    cells.append(click.style(node, fg=color, bold=True))
+                elif live:
+                    cells.append(click.style("│", fg=color))
+                else:
+                    cells.append(" ")
+            graphics = " ".join(cells)
+            e = r.event
+            cmd = describe_command(e)
+            cmd = cmd if len(cmd) <= 68 else cmd[:65] + "..."
+            cmd_col = "yellow" if e["command"] is not None else None
+            exit_s = ""
+            if e["exit_code"] not in (None, 0):
+                exit_s = click.style(f" ✗{e['exit_code']}", fg="red")
+            line = (
+                f"{graphics}  "
+                + click.style(f"#{e['id']}", dim=True)
+                + f" {click.style(cmd, fg=cmd_col, dim=cmd_col is None)}{exit_s}"
+            )
+            click.echo(line)
+            if r.annot:
+                pad = "  " * len(r.lanes)
+                click.secho(f"{pad}  └ {r.annot}", dim=True)
+    finally:
+        conn.close()
+
+
 @main.command(name="branches")
 def branches_cmd() -> None:
     """List the timelines for this directory."""

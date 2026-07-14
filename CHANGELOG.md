@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-07-14
+
+### Added
+- **`chronx graph`** — a cross-timeline commit graph (like `git log --graph`).
+  Each branch gets a colored lane; events lay out newest-first with fork
+  points annotated and merges/external/internal events distinctly marked. Now
+  you can *see* your alternate timelines. Also surfaced in the web UI (`chronx
+  serve` → the **graph** button) via a new read-only `/api/graph` endpoint.
+
 ## 0.2.0 — 2026-07-14
 
 ### Added — timeline merging

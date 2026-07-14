@@ -78,6 +78,7 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx fork <name>` / `switch <name>` | Alternate timelines: branch history, experiment, switch between realities. |
 | `chronx merge <name>` | Three-way merge another timeline into the current one. |
 | `chronx branches` | List the timelines for this directory. |
+| `chronx graph` | Cross-timeline commit graph (à la `git log --graph`); also in the web UI. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |

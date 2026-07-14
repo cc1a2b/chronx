@@ -148,6 +148,28 @@ def api_search(
     return {"mode": "command", "hits": [_event_brief(conn, r) for r in rows]}
 
 
+def api_graph(conn: sqlite3.Connection, root_id: int, limit: int) -> dict:
+    from .graphview import _NODE, build_graph
+
+    g = build_graph(conn, root_id, limit=limit)
+    rows = []
+    for r in g.rows:
+        cells = [
+            (_NODE[r.kind] if col == r.node_lane else ("│" if live else " "))
+            for col, live in enumerate(r.lanes)
+        ]
+        rows.append({
+            "graph": " ".join(cells),
+            "node_lane": r.node_lane,
+            "kind": r.kind,
+            "id": int(r.event["id"]),
+            "time": fmt_ts(r.event["started_at"]).split(" ")[1],
+            "command": describe_command(r.event),
+            "annot": r.annot,
+        })
+    return {"branches": list(g.branch_names), "rows": rows}
+
+
 def api_stats(conn: sqlite3.Connection, paths: Paths, root_id: int | None) -> dict:
     scope, params = "", []
     if root_id is not None:
@@ -251,6 +273,12 @@ class _Handler(BaseHTTPRequestHandler):
                         mode=qs("mode", "command"), limit=qi("limit", 200)))
                 elif path == "/api/stats":
                     self._json(api_stats(conn, self.paths, qi("root")))
+                elif path == "/api/graph":
+                    root = qi("root")
+                    if root is None:
+                        self._json({"branches": [], "rows": []})
+                    else:
+                        self._json(api_graph(conn, root, qi("limit", 200)))
                 else:
                     self._json({"error": "not found"}, 404)
             finally:
@@ -335,6 +363,7 @@ padding:2px 10px;margin:2px;font-size:12px;font-family:ui-monospace,monospace}
   <select id="root"></select>
   <input id="q" placeholder="filter commands…  (prefix S: for content pickaxe)">
   <button id="changes" title="only commands that changed files">± only</button>
+  <button id="graphBtn" title="timeline graph">graph</button>
   <button id="statsBtn" title="statistics">stats</button>
   <span class="tag" id="count"></span>
   <span id="live" title="live"></span>
@@ -448,7 +477,27 @@ async function runSearch(){
 $('#q').addEventListener('keydown',e=>{if(e.key==='Enter')runSearch();
   else if(e.target.value===''){q='';}});
 $('#q').addEventListener('input',e=>{if(e.target.value===''&&q){q='';loadEvents(true);}});
+const LANE_COLORS=['#56b6c2','#8fd07b','#e5c07b','#c678dd','#61afef','#e06c75','#4dd0e1'];
+async function showGraph(){
+  const p=new URLSearchParams({limit:200}); if(root!=null)p.set('root',root);
+  const d=await j('/api/graph?'+p);
+  let legend=d.branches.map((n,i)=>`<span class="pill" style="color:${LANE_COLORS[i%LANE_COLORS.length]}">●${esc(n)}</span>`).join(' ');
+  let h=`<div class="meta">timeline graph</div><p>${legend}</p><pre class="diff" style="padding:8px 10px">`;
+  d.rows.forEach(r=>{
+    let g='';
+    for(let c=0;c<r.graph.length;c++){const ch=r.graph[c];
+      const lane=Math.floor(c/2);const col=LANE_COLORS[lane%LANE_COLORS.length];
+      g+=ch===' '?' ':`<span style="color:${col}">${ch}</span>`;}
+    const cc=r.kind==='cmd'?'var(--yellow)':(r.kind==='merge'?'var(--mag)':'var(--dim)');
+    const annot=r.annot?`<span class="tag"> ← ${esc(r.annot)}</span>`:'';
+    h+=`<div class="ln">${g}  <span class="tag">#${r.id} ${r.time}</span> `+
+       `<span style="color:${cc}">${esc(r.command)}</span>${annot}</div>`;
+  });
+  h+='</pre>'; if(!d.rows.length)h+='<div class="hint">No events yet.</div>';
+  detailEl.innerHTML=h; detailEl.scrollTop=0;
+}
 $('#changes').onclick=()=>{changes=!changes;$('#changes').classList.toggle('on',changes);loadEvents(true);};
+$('#graphBtn').onclick=showGraph;
 $('#statsBtn').onclick=showStats;
 (async()=>{await loadRoots();await loadEvents(true);timer=setInterval(poll,2500);})();
 </script></body></html>
