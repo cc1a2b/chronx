@@ -76,6 +76,7 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx rollback <moment>` | Revert the **whole tree** to a mark, time, or event — one reversible event. |
 | `chronx bisect --good <m> -- <test>` | Binary-search history for the command that broke your test. |
 | `chronx fork <name>` / `switch <name>` | Alternate timelines: branch history, experiment, switch between realities. |
+| `chronx merge <name>` | Three-way merge another timeline into the current one. |
 | `chronx branches` | List the timelines for this directory. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
@@ -146,6 +147,18 @@ chronx branches                    # see both timelines
 
 `chronx fork <name> --at 1h` forks from a *past* moment, so you can explore
 what might have happened if you'd taken a different path an hour ago.
+
+When an experiment works out, bring it back with a three-way merge:
+
+```sh
+chronx switch main
+chronx merge try-async             # auto-merges non-conflicting changes
+```
+
+chronx finds the common-ancestor state, takes whichever side changed each
+file, content-merges non-overlapping edits within a file, and reports real
+conflicts (which you can force in with `--allow-conflicts` to get the usual
+`<<<<<<<`/`>>>>>>>` markers). The merge is one reversible event.
 
 ### Single-file time travel
 

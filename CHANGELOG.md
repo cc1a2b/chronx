@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 — 2026-07-14
+
+### Added — timeline merging
+- **`chronx merge <other>`** — merge another timeline into the active one with
+  a real **three-way merge**: it finds the common-ancestor state (lowest
+  common ancestor branch + fork point), then per file takes the side that
+  changed, or content-merges non-overlapping edits (via `git merge-file` /
+  `diff3`), and reports genuine conflicts. Auto-merges apply as one reversible
+  event; conflicts abort by default (or `--allow-conflicts` writes conflict
+  markers). `--dry-run` previews the plan.
+
+  This completes the branching model from 0.1.9: fork → diverge → merge back.
+
 ## 0.1.9 — 2026-07-14
 
 ### Added — alternate timelines (branching)

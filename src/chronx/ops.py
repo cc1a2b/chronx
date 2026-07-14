@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import sqlite3
 import stat as statmod
 import subprocess
@@ -788,6 +789,249 @@ def switch_branch(
     changed = _materialize(conn, store, paths, root_id, Path(root_row["path"]), target)
     dbm.set_active_branch(conn, root_id, int(branch["id"]))
     return BranchResult(name=name, files_changed=changed, at=time.time())
+
+
+# ------------------------------------------------------------------- merge
+
+
+def _ancestry(conn: sqlite3.Connection, branch: sqlite3.Row) -> list[sqlite3.Row]:
+    """Branch chain from `branch` up to the root (main), inclusive."""
+    chain = [branch]
+    cur = branch
+    seen = {int(branch["id"])}
+    while cur["parent_branch_id"] is not None:
+        parent = dbm.get_branch(conn, int(cur["parent_branch_id"]))
+        if parent is None or int(parent["id"]) in seen:
+            break
+        seen.add(int(parent["id"]))
+        chain.append(parent)
+        cur = parent
+    return chain
+
+
+def merge_base_state(
+    conn: sqlite3.Connection, active: sqlite3.Row, other: sqlite3.Row
+) -> tuple[dict[str, tuple[str | None, int | None]], str]:
+    """The common-ancestor tree state of two timelines, and a description."""
+    pa = _ancestry(conn, active)
+    pb = _ancestry(conn, other)
+    idx_b = {int(b["id"]): i for i, b in enumerate(pb)}
+
+    lca = None
+    ia = 0
+    for i, b in enumerate(pa):
+        if int(b["id"]) in idx_b:
+            lca, ia = b, i
+            break
+    if lca is None:  # unrelated roots; conservative common base = root baseline
+        base = {
+            p: (h, m)
+            for p, (h, m) in dbm.root_baseline(conn, int(active["root_id"])).items()
+        }
+        return base, "root baseline"
+
+    ib = idx_b[int(lca["id"])]
+    # Timestamp at which each lineage forked away from the LCA (inf = is the LCA).
+    ts_a = float(pa[ia - 1]["base_ts"]) if ia > 0 else float("inf")
+    ts_b = float(pb[ib - 1]["base_ts"]) if ib > 0 else float("inf")
+    base_ts = min(ts_a, ts_b)
+    return (
+        branch_state_at(conn, lca, base_ts),
+        f"{lca['name']} @ {fmt_ts(base_ts)}" if base_ts != float("inf")
+        else f"{lca['name']} tip",
+    )
+
+
+def _three_way_merge(
+    base: bytes | None, ours: bytes, theirs: bytes
+) -> tuple[bool, bytes | None]:
+    """Content-level 3-way merge. Returns (clean, merged_bytes).
+
+    Uses `git merge-file` if available, else `diff3 -m`. (False, bytes) means
+    a merge with conflict markers; (False, None) means it couldn't run at all.
+    """
+    for chunk in (base or b"", ours, theirs):
+        if b"\x00" in chunk[:8192]:
+            return (False, None)  # binary; not mergeable
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "base").write_bytes(base or b"")
+        (d / "ours").write_bytes(ours)
+        (d / "theirs").write_bytes(theirs)
+        if shutil.which("git"):
+            proc = subprocess.run(
+                ["git", "merge-file", "-p", "-L", "ours", "-L", "base", "-L", "theirs",
+                 str(d / "ours"), str(d / "base"), str(d / "theirs")],
+                capture_output=True,
+            )
+            if proc.returncode in (0,) or proc.returncode > 0 and proc.stdout:
+                return (proc.returncode == 0, proc.stdout)
+        if shutil.which("diff3"):
+            proc = subprocess.run(
+                ["diff3", "-m", str(d / "ours"), str(d / "base"), str(d / "theirs")],
+                capture_output=True,
+            )
+            if proc.stdout:
+                return (proc.returncode == 0, proc.stdout)
+    return (False, None)
+
+
+@dataclass(frozen=True)
+class MergeFile:
+    rel: str
+    resolution: str  # take-theirs | merged | conflict | add-theirs | delete
+    result_hash: str | None
+    result_mode: int | None
+
+
+@dataclass(frozen=True)
+class MergePlan:
+    other_name: str
+    base_desc: str
+    root: Path
+    root_id: int
+    files: list[MergeFile]
+
+    @property
+    def conflicts(self) -> list[MergeFile]:
+        return [f for f in self.files if f.resolution == "conflict"]
+
+    @property
+    def changes(self) -> list[MergeFile]:
+        return [f for f in self.files if f.resolution != "conflict"]
+
+
+def _blob(store: ObjectStore, digest: str | None) -> bytes | None:
+    if digest is None:
+        return None
+    try:
+        return store.get(digest)
+    except (KeyError, ValueError):
+        return None
+
+
+def plan_merge(
+    conn: sqlite3.Connection, store: ObjectStore, cwd: Path, other_name: str
+) -> MergePlan:
+    root_row = dbm.root_for_path(conn, cwd)
+    if root_row is None:
+        raise OpsError(f"{cwd} is not inside any tracked directory")
+    root_id = int(root_row["id"])
+    active = dbm.active_branch(conn, root_id)
+    if active is None:
+        raise OpsError("no active timeline")
+    other = dbm.branch_by_name(conn, root_id, other_name)
+    if other is None:
+        raise OpsError(f"no timeline named {other_name!r} (see `chronx branches`)")
+    if int(other["id"]) == int(active["id"]):
+        raise OpsError("cannot merge a timeline into itself")
+
+    now = time.time()
+    base, base_desc = merge_base_state(conn, active, other)
+    ours = branch_state_at(conn, active, now)
+    theirs = branch_state_at(conn, other, now)
+
+    files: list[MergeFile] = []
+    for rel in sorted(set(base) | set(ours) | set(theirs)):
+        bh = base.get(rel, (None, None))[0]
+        oh, omode = ours.get(rel, (None, None))
+        th, tmode = theirs.get(rel, (None, None))
+        if oh == th:
+            continue  # already identical on both sides
+        if th == bh:
+            continue  # theirs didn't change it → keep ours
+        if oh == bh:
+            # ours unchanged, theirs changed → take theirs
+            files.append(MergeFile(
+                rel, "delete" if th is None else "take-theirs", th, tmode))
+            continue
+        # both sides changed this file differently
+        if oh is None or th is None:
+            files.append(MergeFile(rel, "conflict", None, None))  # add/delete clash
+            continue
+        merged_clean, merged_bytes = _three_way_merge(
+            _blob(store, bh), _blob(store, oh) or b"", _blob(store, th) or b"")
+        if merged_bytes is None:
+            files.append(MergeFile(rel, "conflict", None, None))
+        else:
+            digest = store.put_bytes(merged_bytes)
+            files.append(MergeFile(
+                rel, "merged" if merged_clean else "conflict", digest, omode or tmode))
+    return MergePlan(other_name, base_desc, Path(root_row["path"]), root_id, files)
+
+
+def apply_merge(
+    conn: sqlite3.Connection,
+    store: ObjectStore,
+    paths: Paths,
+    plan: MergePlan,
+    active_name: str,
+    *,
+    allow_conflicts: bool,
+) -> tuple[int, int]:
+    """Write the merged tree and record the merge as one event on the active
+    branch. Returns (event_id, files_changed)."""
+    to_apply = [
+        f for f in plan.files
+        if f.resolution != "conflict" or (allow_conflicts and f.result_hash)
+    ]
+    if not to_apply:
+        raise OpsError("nothing to merge (already up to date, or all conflicts)")
+
+    deltas: list[dbm.Delta] = []
+    manifest_updates: dict[str, dbm.ManifestEntry] = {}
+    manifest_deletes: set[str] = set()
+    for f in to_apply:
+        full = plan.root / f.rel
+        data, st = _current_state(full)
+        cur_hash = hash_bytes(data) if data is not None else None
+        cur_size = len(data) if data is not None else None
+        cur_mode = st.st_mode if st is not None else None
+        if data is not None:
+            store.put_bytes(data)  # safety snapshot
+        if f.result_hash is None:
+            try:
+                full.unlink(missing_ok=True)
+            except OSError as exc:
+                raise OpsError(f"could not remove {f.rel}: {exc}") from exc
+            if cur_hash is not None:
+                deltas.append(dbm.Delta(
+                    f.rel, "D", cur_hash, None, cur_size, None, cur_mode, None))
+            manifest_deletes.add(f.rel)
+        else:
+            blob = store.get(f.result_hash)
+            try:
+                _write_atomic(full, blob, f.result_mode)
+            except OSError as exc:
+                raise OpsError(f"could not write {f.rel}: {exc}") from exc
+            new_st = os.lstat(full)
+            change = "M" if cur_hash is not None else "A"
+            deltas.append(dbm.Delta(
+                f.rel, change, cur_hash, f.result_hash,
+                cur_size, len(blob), cur_mode, new_st.st_mode))
+            manifest_updates[f.rel] = dbm.ManifestEntry(
+                hash=f.result_hash, size=len(blob),
+                mtime=new_st.st_mtime, mode=new_st.st_mode)
+
+    now = time.time()
+    conflict_note = ""
+    if allow_conflicts and plan.conflicts:
+        conflict_note = f" (with {len(plan.conflicts)} conflict(s))"
+    event_id = dbm.record_event(
+        conn,
+        session=UNDO_SESSION,
+        root_id=plan.root_id,
+        cwd=str(plan.root),
+        command=f"chronx merge {plan.other_name} into {active_name}{conflict_note}",
+        started_at=now,
+        finished_at=now,
+        exit_code=0,
+        deltas=deltas,
+        manifest_updates=manifest_updates,
+        manifest_deletes=manifest_deletes,
+    )
+    send_line(paths.fifo, encode_sync(str(plan.root)))
+    return event_id, len(deltas)
 
 
 # ------------------------------------------------------------------ bisect

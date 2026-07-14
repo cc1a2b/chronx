@@ -1155,6 +1155,80 @@ def switch(name: str) -> None:
         conn.close()
 
 
+@main.command()
+@click.argument("other")
+@click.option("--allow-conflicts", is_flag=True,
+              help="Apply the merge even with conflicts, writing conflict markers.")
+@click.option("--dry-run", is_flag=True, help="Show the merge plan and stop.")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def merge(other: str, allow_conflicts: bool, dry_run: bool, yes: bool) -> None:
+    """Merge timeline OTHER into the current one (three-way merge).
+
+    Brings the changes from another timeline into the active one, auto-merging
+    files that changed on only one side (and non-overlapping edits within a
+    file), and reporting genuine conflicts. Recorded as one reversible event.
+    """
+    from .ops import apply_merge, plan_merge
+
+    paths = _paths()
+    conn = _open_db(paths, readonly=dry_run)
+    store = ObjectStore(paths.objects)
+    try:
+        active = None
+        root = dbm.root_for_path(conn, Path.cwd())
+        if root is not None:
+            ab = dbm.active_branch(conn, int(root["id"]))
+            active = ab["name"] if ab is not None else None
+        if not dry_run:
+            _require_stopped_clean(paths, conn, "merging")
+        try:
+            plan = plan_merge(conn, store, Path.cwd(), other)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        click.secho(
+            f"merging {other!r} into {active or '(active)'} "
+            f"(base: {plan.base_desc})", bold=True)
+        if not plan.files:
+            click.secho("already up to date — nothing to merge", fg="green")
+            return
+        verb = {"take-theirs": "take ", "add-theirs": "add  ", "merged": "merge",
+                "delete": "del  ", "conflict": "CONFL"}
+        for f in plan.files:
+            style = {"fg": "red"} if f.resolution == "conflict" else (
+                {"fg": "cyan"} if f.resolution == "merged" else {})
+            click.echo("  " + click.style(f"{verb[f.resolution]} {f.rel}", **style))
+        n_conf = len(plan.conflicts)
+        n_change = len(plan.changes)
+        click.echo()
+        click.secho(f"{n_change} file(s) to update, {n_conf} conflict(s)", dim=True)
+
+        if dry_run:
+            click.secho("dry run: nothing was changed", dim=True)
+            return
+        if n_conf and not allow_conflicts:
+            raise click.ClickException(
+                f"{n_conf} conflict(s) — resolve by hand, or re-run with "
+                "--allow-conflicts to write conflict markers into the files")
+        if not yes and not click.confirm("Apply the merge?", default=False):
+            click.echo("aborted")
+            return
+        try:
+            event_id, changed = apply_merge(
+                conn, store, paths, plan, active or "active",
+                allow_conflicts=allow_conflicts)
+        except OpsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"merged {other!r}: {changed} file(s) updated "
+                    f"(event #{event_id})", fg="green")
+        if n_conf and allow_conflicts:
+            click.secho(f"  {n_conf} file(s) contain conflict markers — resolve them, "
+                        "then run a command to record the resolution", fg="yellow")
+        click.secho(f"  undo this merge with `chronx undo --event {event_id}`", dim=True)
+    finally:
+        conn.close()
+
+
 @main.command(name="branches")
 def branches_cmd() -> None:
     """List the timelines for this directory."""
