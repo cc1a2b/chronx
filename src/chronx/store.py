@@ -40,6 +40,10 @@ class ObjectStore:
     def has(self, digest: str) -> bool:
         return self._path(digest).is_file()
 
+    def path_for(self, digest: str) -> Path:
+        """On-disk location of a blob (may not exist)."""
+        return self._path(digest)
+
     def put_bytes(self, data: bytes) -> str:
         """Store raw content; return its digest. No-op if already present."""
         digest = hash_bytes(data)

@@ -78,6 +78,8 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |
 | `chronx sessions` | List recorded shell sessions; `chronx log -s <id>` filters to one. |
 | `chronx report` | Shareable Markdown of a window/session: `chronx report --since 2h --full > session.md`. |
+| `chronx status` | Working-tree changes not yet recorded (drift vs the last snapshot). |
+| `chronx export` / `import` | Move recorded history between machines; `import <a> --as .` re-attaches it here. |
 | `chronx stats` | Hottest files, noisiest commands, store size. |
 | `chronx doctor` | Diagnose the pipeline: store, db, daemon, fifo, hooks, disk. |
 | `chronx roots` | List tracked directories; `roots forget <path>` erases one's history. |

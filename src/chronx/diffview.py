@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import difflib
+from pathlib import Path
 
 from .db import Delta
+from .snapshot import WorkingChange
 from .store import ObjectStore
 
 MAX_DIFF_LINES = 400
@@ -92,6 +94,60 @@ def render_delta(
     if not body:
         body = ["@@ content unchanged (metadata-only) @@"]
     return header + body
+
+
+def render_working_change(
+    store: ObjectStore, root: Path, change: WorkingChange,
+    *, max_lines: int = MAX_DIFF_LINES,
+) -> list[str]:
+    """Unified diff for a live drift: before from the store, after read from disk."""
+    after: bytes | None = None
+    if change.change != "D":
+        try:
+            after = (root / change.rel).read_bytes()
+        except OSError:
+            after = None
+    delta = Delta(
+        change.rel, change.change, change.before_hash,
+        None if after is None else "live", change.before_size, change.after_size,
+        None, None,
+    )
+    # Reuse the core renderer for headers/binary handling by feeding live bytes.
+    before = _load(store, change.before_hash)
+    header = [
+        f"--- a/{change.rel}" if change.change != "A" else "--- /dev/null",
+        f"+++ b/{change.rel}" if change.change != "D" else "+++ /dev/null",
+    ]
+    if change.change != "A" and before is None:
+        return header + [f"@@ base blob {change.before_hash and change.before_hash[:12]} "
+                         "unavailable @@"]
+    if (before and _is_binary(before)) or (after and _is_binary(after)):
+        return header + ["@@ binary file @@"]
+    try:
+        before_lines = (before or b"").decode("utf-8").splitlines(keepends=True)
+        after_lines = (after or b"").decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return header + ["@@ binary (non-utf8) file @@"]
+    body: list[str] = []
+    for line in difflib.unified_diff(before_lines, after_lines, n=3, lineterm=""):
+        if line.startswith(("---", "+++")):
+            continue
+        body.append(line.rstrip("\n"))
+        if len(body) >= max_lines:
+            body.append(f"@@ ... diff truncated at {max_lines} lines @@")
+            break
+    _ = delta
+    return header + (body or ["@@ no textual change @@"])
+
+
+def working_stat_line(change: WorkingChange) -> str:
+    if change.change == "A":
+        detail = f"(+{change.after_size or 0} bytes, unrecorded)"
+    elif change.change == "D":
+        detail = f"(-{change.before_size or 0} bytes, still on record)"
+    else:
+        detail = f"({change.before_size or 0} -> {change.after_size or '?'} bytes)"
+    return f"{change.change}  {change.rel}  {detail}"
 
 
 def stat_line(delta: Delta) -> str:

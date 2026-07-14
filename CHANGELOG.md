@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.5 — 2026-07-13
+
+### Added
+- **`chronx export` / `chronx import`** — move recorded history between
+  machines. Export bundles a root's events, deltas, marks, manifest, and every
+  referenced blob into one gzip-compressed archive; import verifies each blob
+  re-hashes to its name, dedups against the local store, and re-attaches the
+  history under `--as <dir>` (paths remapped, marks de-collided). Reproduce a
+  colleague's debugging session locally, then `rollback` into it.
+- **`chronx status`** — working-tree drift versus the last recorded state
+  (like `git status` for un-snapshotted changes): catches edits made while the
+  daemon was stopped or a command still in flight. Read-only — hashes in
+  memory, writes nothing. `--stat` for a summary, `--all-roots` to sweep all.
+
 ## 0.1.4 — 2026-07-13
 
 ### Added

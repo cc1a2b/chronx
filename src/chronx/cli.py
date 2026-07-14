@@ -1227,6 +1227,148 @@ def report(since: str, until: str | None, session: str | None,
         conn.close()
 
 
+# ------------------------------------------------------------------ status
+
+
+@main.command()
+@click.option("--stat", is_flag=True, help="Only list changed files, no content diff.")
+@click.option("--all-roots", is_flag=True,
+              help="Check every tracked directory, not just the current one.")
+def status(stat: bool, all_roots: bool) -> None:
+    """Show working-tree changes not yet recorded (drift vs the last snapshot).
+
+    Catches edits made while the daemon was stopped, or an in-flight command's
+    changes. Read-only: nothing is hashed to the store or recorded.
+    """
+    from .snapshot import working_changes
+    from .diffview import render_working_change, working_stat_line
+
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+    cfg = Config.load(paths)
+    try:
+        if all_roots:
+            roots_list = dbm.get_roots(conn)
+        else:
+            root = dbm.root_for_path(conn, Path.cwd())
+            if root is None:
+                raise click.ClickException(
+                    f"{Path.cwd()} is not inside any tracked directory"
+                )
+            roots_list = [root]
+
+        any_drift = False
+        for root in roots_list:
+            manifest = dbm.load_manifest(conn, int(root["id"]))
+            changes = working_changes(Path(root["path"]), manifest, cfg)
+            if not changes:
+                continue
+            any_drift = True
+            click.secho(f"{root['path']}", bold=True)
+            for ch in changes:
+                if stat:
+                    click.echo("  " + working_stat_line(ch))
+                else:
+                    for line in render_working_change(store, Path(root["path"]), ch):
+                        _echo_diff_line(line)
+                    click.echo()
+            if stat:
+                click.echo()
+        if not any_drift:
+            click.secho("working tree matches the last recorded state", fg="green")
+        else:
+            click.secho(
+                "these changes are not yet recorded — run a command (or "
+                "`chronx exec`) to capture them, or start the daemon",
+                dim=True,
+            )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------- export / import
+
+
+@main.command("export")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Archive path (default: <root-name>-<n>ev.chronx in cwd).")
+@click.option("--root", "root_path", type=click.Path(path_type=Path), default=None,
+              help="Which tracked root to export (default: the one containing cwd).")
+def export_cmd(output: Path | None, root_path: Path | None) -> None:
+    """Bundle a directory's recorded history into a portable archive.
+
+    Move a debugging session to another machine:
+    `chronx export -o bug.chronx` there, `chronx import bug.chronx --as .` here.
+    """
+    from .transfer import TransferError, export_root
+
+    paths = _paths()
+    conn = _open_db(paths)
+    store = ObjectStore(paths.objects)
+    try:
+        target = (root_path or Path.cwd()).resolve()
+        row = dbm.root_for_path(conn, target)
+        if row is None:
+            raise click.ClickException(f"{target} is not inside any tracked directory")
+        if output is None:
+            name = Path(row["path"]).name or "root"
+            n = conn.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE root_id = ?", (row["id"],)
+            ).fetchone()["n"]
+            output = Path.cwd() / f"{name}-{n}ev.chronx"
+        try:
+            stats = export_root(conn, store, row, output)
+        except TransferError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.secho(f"exported {stats.root}", fg="green")
+        click.echo(
+            f"  {stats.events} event(s), {stats.deltas} delta(s), {stats.marks} mark(s), "
+            f"{stats.blobs} blob(s)"
+        )
+        click.echo(f"  -> {output}  ({_human_bytes(stats.bytes_written)})")
+    finally:
+        conn.close()
+
+
+@main.command("import")
+@click.argument("archive", type=click.Path(exists=True, path_type=Path))
+@click.option("--as", "as_path", type=click.Path(path_type=Path), default=None,
+              help="Map the history onto this local directory (default: original path).")
+def import_cmd(archive: Path, as_path: Path | None) -> None:
+    """Import history from a `chronx export` archive into the local store.
+
+    The daemon must be stopped. Use `--as .` to attach the imported history
+    to the current directory, then `chronx log` / `rollback` against it.
+    """
+    from .transfer import TransferError, import_archive
+
+    paths = _paths()
+    if not paths.db.exists():
+        raise click.ClickException("run `chronx init` first")
+    pid = daemonmod.daemon_pid(paths)
+    if pid is not None:
+        raise click.ClickException(
+            f"daemon is running (pid {pid}) — stop it first: chronx daemon stop"
+        )
+    try:
+        stats = import_archive(paths, archive, as_path=as_path)
+    except TransferError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.secho(f"imported into {stats.root}", fg="green")
+    click.echo(
+        f"  {stats.events} event(s), {stats.deltas} delta(s), "
+        f"{stats.marks} mark(s), blobs +{stats.blobs_added} "
+        f"({stats.blobs_skipped} already present)"
+    )
+    if stats.remapped:
+        click.secho("  paths remapped to the target directory", dim=True)
+    if stats.marks_renamed:
+        click.secho(f"  {stats.marks_renamed} mark(s) renamed to avoid collisions",
+                    dim=True)
+    click.secho("  explore with `chronx log`, `chronx diff`, `chronx rollback`", dim=True)
+
+
 # ------------------------------------------------------------------- roots
 
 

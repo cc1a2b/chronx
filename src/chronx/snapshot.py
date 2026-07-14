@@ -8,9 +8,11 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterator
 
+from dataclasses import dataclass
+
 from .config import Config
 from .db import Delta, ManifestEntry
-from .store import ObjectStore
+from .store import ObjectStore, hash_bytes
 
 
 def is_ignored_rel(rel: str, cfg: Config) -> bool:
@@ -107,6 +109,48 @@ def _expand_candidates(
         else:
             expanded.add(rel)
     return expanded
+
+
+@dataclass(frozen=True)
+class WorkingChange:
+    """A live working-tree difference vs the recorded manifest (read-only)."""
+
+    rel: str
+    change: str  # 'A' added, 'M' modified, 'D' deleted
+    before_hash: str | None
+    before_size: int | None
+    after_size: int | None
+
+
+def working_changes(
+    root: Path, manifest: dict[str, ManifestEntry], cfg: Config
+) -> list[WorkingChange]:
+    """Compare the live tree to the manifest WITHOUT storing anything.
+
+    Shows drift the daemon hasn't recorded yet (e.g. edits made while it was
+    stopped, or an in-flight command). Content is hashed in memory only.
+    """
+    changes: list[WorkingChange] = []
+    seen: set[str] = set()
+    for rel, st in iter_files(root, cfg):
+        seen.add(rel)
+        entry = manifest.get(rel)
+        if entry is not None and entry.size == st.st_size and entry.mtime == st.st_mtime:
+            continue  # cheap unchanged
+        try:
+            data = (root / rel).read_bytes()
+        except OSError:
+            continue
+        digest = hash_bytes(data)
+        if entry is None:
+            changes.append(WorkingChange(rel, "A", None, None, len(data)))
+        elif digest != entry.hash:
+            changes.append(WorkingChange(rel, "M", entry.hash, entry.size, len(data)))
+    for rel, entry in manifest.items():
+        if rel not in seen:
+            changes.append(WorkingChange(rel, "D", entry.hash, entry.size, None))
+    changes.sort(key=lambda c: c.rel)
+    return changes
 
 
 def compute_deltas(

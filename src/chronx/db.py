@@ -270,6 +270,17 @@ def deltas_for(conn: sqlite3.Connection, event_id: int) -> list[Delta]:
     ]
 
 
+def deltas_for_rows(conn: sqlite3.Connection, event_id: int) -> list[sqlite3.Row]:
+    """Raw delta rows for an event (used by export)."""
+    return list(
+        conn.execute(
+            "SELECT path, change, before_hash, after_hash, before_size, after_size,"
+            " before_mode, after_mode FROM deltas WHERE event_id = ? ORDER BY path",
+            (event_id,),
+        )
+    )
+
+
 def delta_counts(conn: sqlite3.Connection, event_id: int) -> dict[str, int]:
     counts = {"A": 0, "M": 0, "D": 0}
     for row in conn.execute(
@@ -437,6 +448,28 @@ def root_summaries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             " FROM roots r ORDER BY r.path"
         )
     )
+
+
+def root_referenced_hashes(conn: sqlite3.Connection, root_id: int) -> set[str]:
+    """Every blob digest reachable from one root's deltas or manifest."""
+    refs: set[str] = set()
+    for column in ("before_hash", "after_hash"):
+        refs.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT d.{column} FROM deltas d"
+                f" JOIN events e ON e.id = d.event_id"
+                f" WHERE e.root_id = ? AND d.{column} IS NOT NULL",
+                (root_id,),
+            )
+        )
+    refs.update(
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT hash FROM manifest WHERE root_id = ?", (root_id,)
+        )
+    )
+    return refs
 
 
 def forget_root(conn: sqlite3.Connection, root_id: int) -> tuple[int, int]:
