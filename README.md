@@ -89,6 +89,16 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx summary [window]` | Digest of what changed over a time window. |
 | `chronx format-patch <ref>` | Export an event as a `git apply`-compatible patch. |
 | `chronx cherry-pick <event>` | Apply one event's changes onto the current tree (reversible). |
+| `chronx whatchanged <file>` | Full diff history of one file over time (`git log -p`). |
+| `chronx line-history <file> <pat>` | Trace a line's lifecycle: added → removed → re-added. |
+| `chronx hotspots` | Volatile files + change-coupling (which files change together). |
+| `chronx recover [<glob>]` | Bring back deleted files (reversible). |
+| `chronx stash` / `pop` | Shelve un-recorded working-tree drift and restore it later. |
+| `chronx archive <ref> -o <f>` | `git archive` for time — tar/zip of the tree at any moment. |
+| `chronx reproduce <event>` | Re-run a command in isolation and check it still does the same thing. |
+| `chronx cast -o <f.html>` | Self-contained, shareable HTML replay of a session. |
+| `chronx dump` | Export history as JSON for `jq` / external tooling. |
+| `chronx reflog` | Log of chronx's own operations = recovery points. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |

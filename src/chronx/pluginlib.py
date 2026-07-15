@@ -20,16 +20,20 @@ from . import daemon as _daemonmod
 from . import db as dbm
 from .config import Config, Paths
 from .diffview import render_delta, stat_line
+from .ipc import encode_sync as _encode_sync
+from .ipc import send_line as _send_line
 from .ops import OpsError, branch_state_at, describe_command, state_at
+from .snapshot import working_changes
 from .store import ObjectStore, hash_bytes
 from .when import WhenParseError, fmt_ts, parse_when
 
 __all__ = [
     "click", "sqlite3", "Path", "dbm", "Config", "Paths", "ObjectStore",
     "hash_bytes", "render_delta", "stat_line", "describe_command", "OpsError",
-    "branch_state_at", "state_at", "fmt_ts",
+    "branch_state_at", "state_at", "fmt_ts", "working_changes",
     "paths", "open_db", "human_bytes", "parse_at", "moment_ts",
     "require_daemon_stopped", "root_for_cwd", "active_branch_id",
+    "current_file_state", "write_atomic", "send_sync",
 ]
 
 
@@ -140,6 +144,54 @@ def require_daemon_stopped(action: str = "this") -> None:
             f"daemon is running (pid {pid}) — stop it first: chronx daemon stop\n"
             f"({action} would race with the recorder)"
         )
+
+
+def current_file_state(path):
+    """(bytes|None, os.stat_result|None) for a path.
+
+    bytes is None if the path is absent, a non-regular file, or unreadable.
+    """
+    import os
+    import stat as _stat
+
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None, None
+    if not _stat.S_ISREG(st.st_mode):
+        return None, st
+    try:
+        return Path(path).read_bytes(), st
+    except OSError:
+        return None, st
+
+
+def write_atomic(path, data: bytes, mode: int | None = None) -> None:
+    """Atomically write bytes to `path` (temp file + os.replace), making parents."""
+    import os
+    import stat as _stat
+    import tempfile
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".chronx-plugin-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if mode is not None:
+            os.chmod(tmp, _stat.S_IMODE(mode))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def send_sync(root_path) -> None:
+    """Tell a running daemon to resync its manifest for `root_path` after a write."""
+    _send_line(paths().fifo, _encode_sync(str(root_path)))
 
 
 _VALID_NAME = _re.compile(r"^[A-Za-z][\w.-]*$")

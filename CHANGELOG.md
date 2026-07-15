@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.4 — 2026-07-15
+
+### Added — 10 more commands (plugins)
+- **`chronx whatchanged <file>`** — the complete change history of one file as a
+  series of diffs over time (`git log -p <file>`).
+- **`chronx hotspots`** — code hotspot + **change-coupling** analysis: most
+  volatile files and which files tend to change together.
+- **`chronx dump`** — export history as structured, metadata-only JSON for
+  `jq` / external tooling (`--pretty`, `--since`, `--all-roots`).
+- **`chronx reflog`** — a log of chronx's own operations (undo/rollback/merge/
+  cherry-pick), i.e. reversible recovery points, à la `git reflog`.
+- **`chronx archive <ref> -o <file>`** — `git archive` for time: a tar.gz/zip of
+  the working tree at any moment/mark/event/branch, openable without chronx.
+- **`chronx line-history <file> <pattern>`** — trace a line's lifecycle across
+  history: when it was added, removed, changed, or re-added.
+- **`chronx cast -o <file.html>`** — a self-contained, offline HTML "replay" of a
+  session (timeline + colorized diffs), shareable, no server required.
+- **`chronx reproduce <event>`** — re-run a recorded command in an isolated
+  checkout of its pre-state and compare the effects to what was recorded — a
+  determinism / reproducibility check. Never touches your working tree.
+- **`chronx recover [<glob>]`** — bring back deleted files (restore last-recorded
+  content), as one reversible event.
+- **`chronx stash` / `pop` / `list` / `drop`** — shelve un-recorded working-tree
+  drift and restore it later, like `git stash` (sidecar-based; not a recorded
+  event).
+
+### Changed
+- `chronx.pluginlib` gained `working_changes`, `current_file_state`,
+  `write_atomic`, and `send_sync` helpers for write-capable plugins.
+
 ## 0.2.3 — 2026-07-15
 
 ### Added — a plugin system and 10 new commands
