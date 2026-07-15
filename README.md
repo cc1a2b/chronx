@@ -79,6 +79,16 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx merge <name>` | Three-way merge another timeline into the current one. |
 | `chronx branches` | List the timelines for this directory. |
 | `chronx graph` | Cross-timeline commit graph (à la `git log --graph`); also in the web UI. |
+| `chronx checkout <ref> <dir>` | Materialize the full tree at any moment/mark/event/branch into a fresh dir. |
+| `chronx grep <regex>` | Search **every past version** of every file (incl. deleted ones). |
+| `chronx annotate <file>` | Line-level temporal blame — which event introduced each line. |
+| `chronx find <glob>` | Every path that ever existed + its lifetime (created → deleted). |
+| `chronx audit` | Scan all history for leaked secrets — catches secrets committed then deleted. |
+| `chronx du` | Storage analytics: dedup ratio, biggest blobs, per-timeline attribution. |
+| `chronx activity` | Contribution heatmap + punchcard of your recorded sessions. |
+| `chronx summary [window]` | Digest of what changed over a time window. |
+| `chronx format-patch <ref>` | Export an event as a `git apply`-compatible patch. |
+| `chronx cherry-pick <event>` | Apply one event's changes onto the current tree (reversible). |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |
@@ -286,6 +296,19 @@ matched against file basenames.
   folded into the baseline snapshot (the watch is only set up when chronx
   first sees the directory). `chronx exec` doesn't have this race — it waits
   for the watch before running.
+- A file created *and* deleted within a single command is not captured: the
+  recorder reads content at settle time (after the command), when the transient
+  file no longer exists.
+
+## Extending chronx (plugins)
+
+Feature commands live as self-contained modules under `chronx/plugins/`, each
+exposing `register(main)` and using the stable `chronx.pluginlib` helper
+surface. They are auto-discovered from the filesystem and loaded defensively
+(a broken plugin is skipped, never fatal), so dropping a new `.py` in that
+directory adds a command with no reinstall. Most of the commands above
+(`checkout`, `grep`, `annotate`, `find`, `audit`, `du`, `activity`, `summary`,
+`format-patch`, `cherry-pick`) are built this way.
 - Two commands running simultaneously in the *same* directory race for
   attribution; the first to finish claims the change.
 - chronx is a workflow debugger, not a backup system — the object store lives

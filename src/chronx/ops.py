@@ -1417,7 +1417,8 @@ def record_and_run(
         or f"chronx-exec-{os.getpid()}"
     )
 
-    if not send_line(paths.fifo, encode_pre(session, time.time(), str(cwd), display)):
+    pre_ts = time.time()
+    if not send_line(paths.fifo, encode_pre(session, pre_ts, str(cwd), display)):
         raise OpsError(
             "the chronx daemon is not running (`chronx daemon start`), "
             "so this command would not be recorded"
@@ -1434,7 +1435,35 @@ def record_and_run(
         raise
     finally:
         send_line(paths.fifo, encode_post(session, time.time(), rc))
+    _wait_for_event(paths, session, pre_ts)
     return rc
+
+
+def _wait_for_event(
+    paths: Paths, session: str, pre_ts: float, *, timeout: float = 8.0
+) -> None:
+    """Block until the daemon has finalized THIS command's event.
+
+    Without this, `chronx exec` returns before the settle window fires, so
+    rapid successive commands get their changes merged into one event and
+    scripted/CI callers can't rely on the recording being complete on return.
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        conn = dbm.connect(paths.db, readonly=True)
+    except sqlite3.Error:
+        return
+    try:
+        while time.monotonic() < deadline:
+            row = conn.execute(
+                "SELECT id FROM events WHERE session = ? AND started_at = ? LIMIT 1",
+                (session, pre_ts),
+            ).fetchone()
+            if row is not None:
+                return
+            time.sleep(0.05)
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ gc

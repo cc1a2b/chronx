@@ -2094,5 +2094,49 @@ def replay(limit: int, all_roots: bool) -> None:
     ReplayApp(paths, limit=limit, all_roots=all_roots).run()
 
 
+def _load_plugins() -> None:
+    """Auto-discover and register feature plugins under chronx/plugins/.
+
+    Discovery is by filesystem scan of the real package directory (so a plugin
+    file dropped in is picked up without reinstalling), and loading is
+    defensive: a plugin that fails to import or register is skipped (surfaced
+    only under CHRONX_DEBUG), so one bad module never breaks the CLI.
+    """
+    import importlib.util
+    import sys
+
+    plugin_dir = Path(__file__).resolve().parent / "plugins"
+    if not plugin_dir.is_dir():
+        return
+    for f in sorted(plugin_dir.glob("*.py")):
+        if f.name.startswith("_"):
+            continue
+        modname = f"chronx.plugins.{f.stem}"
+        try:
+            spec = importlib.util.spec_from_file_location(modname, f)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            # Register in sys.modules BEFORE exec so machinery that looks up
+            # sys.modules[cls.__module__] (e.g. @dataclass under 3.13) works.
+            sys.modules[modname] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(modname, None)  # don't leave a half-init module
+                raise
+            register = getattr(mod, "register", None)
+            if callable(register):
+                register(main)
+        except Exception as exc:  # never let a plugin break chronx
+            if os.environ.get("CHRONX_DEBUG"):
+                import warnings
+
+                warnings.warn(f"chronx: skipped plugin {f.name!r}: {exc}")
+
+
+_load_plugins()
+
+
 if __name__ == "__main__":
     main()

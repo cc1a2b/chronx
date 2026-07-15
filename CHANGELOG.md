@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.3 — 2026-07-15
+
+### Added — a plugin system and 10 new commands
+- **Plugin architecture**: features now live as self-contained modules under
+  `chronx/plugins/`, auto-discovered from the filesystem and loaded defensively
+  (a broken plugin is skipped, never fatal). They use a stable helper surface
+  (`chronx.pluginlib`) and never touch the core CLI.
+- **`chronx checkout <ref> <dir>`** — materialize the full tree at any moment /
+  mark / event / branch tip into a fresh directory (a time-travel worktree),
+  without touching your live tree.
+- **`chronx grep <regex>`** — temporal content search: find a pattern in *any
+  recorded version of any file*, including versions later changed or deleted.
+- **`chronx annotate <file>`** — line-level temporal blame (`git blame` across
+  chronx history), attributing each line to the event that introduced it.
+- **`chronx du`** — storage analytics: dedup/compression ratios, largest blobs
+  and what references them, per-timeline attribution.
+- **`chronx activity`** — a GitHub-style contribution heatmap + hour punchcard
+  and streak/insight stats over your recorded sessions.
+- **`chronx audit`** — scan *every* recorded file version for leaked secrets
+  (AWS/GitHub/Slack/Google keys, private keys, high-entropy tokens). Catches
+  secrets that were committed then deleted; redacts matches; exits non-zero.
+- **`chronx format-patch <ref>`** — export an event (or `A..B` range) as a
+  `git apply` / `git am` / `patch -p1`-compatible unified diff.
+- **`chronx find <glob>`** — every path that ever existed matching a glob, with
+  its lifetime (created → deleted), even for files long gone.
+- **`chronx summary [window]`** — a digest of what changed over a time window:
+  command/failure counts, insertions/deletions, hottest files, busiest commands.
+- **`chronx cherry-pick <event>`** — apply one recorded event's file changes
+  onto the current tree (across timelines), recorded as a reversible event.
+
+### Fixed
+- **`chronx exec`** now blocks until its event is finalized before returning, so
+  scripted/CI callers can rely on the recording being complete — and rapid
+  successive `exec` calls no longer collapse into one event.
+
+### Known limitation
+- A file created *and* deleted within a single command is not captured: the
+  recorder reads content at settle time (post-command), when the transient file
+  is already gone.
+
 ## 0.2.2 — 2026-07-14
 
 ### Added — networked history
