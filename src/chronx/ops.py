@@ -1326,17 +1326,22 @@ def range_changes(
     if root_row is None:
         raise OpsError(f"{cwd} is not inside any tracked directory")
     root_id = int(root_row["id"])
+    branch_id = dbm.active_branch_id(conn, root_id)
 
     changes: list[RangeChange] = []
+    branch_clause = "" if branch_id is None else " AND e.branch_id = ?"
+    params: list[object] = [root_id, a_ts, b_ts]
+    if branch_id is not None:
+        params.append(branch_id)
     for rel in conn.execute(
         "SELECT DISTINCT d.path FROM deltas d JOIN events e ON e.id = d.event_id"
-        " WHERE e.root_id = ? AND e.started_at > ? AND e.started_at <= ?"
+        f" WHERE e.root_id = ? AND e.started_at > ? AND e.started_at <= ?{branch_clause}"
         " ORDER BY d.path",
-        (root_id, a_ts, b_ts),
+        params,
     ):
         rel = rel["path"]
-        first = dbm.first_delta_after(conn, root_id, rel, a_ts)
-        last = dbm.last_delta_for_path(conn, root_id, rel, at=b_ts)
+        first = dbm.first_delta_after(conn, root_id, rel, a_ts, branch_id=branch_id)
+        last = dbm.last_delta_for_path(conn, root_id, rel, at=b_ts, branch_id=branch_id)
         if first is None or last is None:  # defensive; window query implies both
             continue
         a_hash, b_hash = first["before_hash"], last["after_hash"]

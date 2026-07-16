@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.5 — 2026-07-16
+
+### Added — 11 more commands (plugins)
+- **`chronx ls [ref]`** — list files as they were at any moment/mark/event/branch
+  (`-l` sizes+modes, `--tree`, `--path`).
+- **`chronx sql [query]`** — a read-only SQL console over the store (writes are
+  physically refused; `--schema`, `--tables`, `--json`).
+- **`chronx since <moment>`** — the net cumulative diff since a moment, plus the
+  commands responsible (`--stat`, `--commands`).
+- **`chronx monitor`** — a live dashboard that tails recording in real time.
+- **`chronx verify-store`** — a deep integrity + referential-consistency audit
+  (blobs, foreign keys, manifest, delta shape, orphans, metadata) beyond `fsck`.
+- **`chronx churn --by session|day|command|ext`** — line-churn report grouped by
+  a dimension.
+- **`chronx note add/show/list/rm`** — attach freeform notes to events via a
+  sidecar (history stays pristine).
+- **`chronx open <file> [when] [--vs other]`** — view a historical version in
+  your pager, or diff any two moments of a file.
+- **`chronx timings`** — wall-clock duration analytics (slowest runs, time by
+  command, distribution).
+- **`chronx diff-tree <refA> <refB>`** — structural tree comparison between any
+  two moments *or branch tips* (`-p`, `--name-only`).
+- **`chronx failures`** — failed-command analysis: exit-code distribution,
+  most-failing commands, and time-to-fix.
+
+### Fixed
+- `range_changes` (used by `chronx diff A..B` and `chronx since`) is now scoped
+  to the active timeline, so it no longer leaks changes from other branches.
+
+### Changed
+- `chronx.pluginlib` re-exports `is_ignored_rel` / `load_root_ignore`;
+  `last_delta_for_path` gained a `branch_id` filter.
+
 ## 0.2.4 — 2026-07-15
 
 ### Added — 10 more commands (plugins)

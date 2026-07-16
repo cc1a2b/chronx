@@ -762,9 +762,10 @@ def last_delta_for_path(
     *,
     at: float | None = None,
     event_id: int | None = None,
+    branch_id: int | None = None,
 ) -> sqlite3.Row | None:
     """The most recent delta touching rel_path (optionally at/before a time,
-    or within one specific event)."""
+    within one specific event, or scoped to one branch)."""
     sql = (
         "SELECT d.*, e.id AS event_id, e.started_at AS started_at,"
         " e.command AS command"
@@ -778,6 +779,9 @@ def last_delta_for_path(
     if at is not None:
         sql += " AND e.started_at <= ?"
         params.append(at)
+    if branch_id is not None:
+        sql += " AND e.branch_id = ?"
+        params.append(branch_id)
     sql += " ORDER BY e.id DESC LIMIT 1"
     return conn.execute(sql, params).fetchone()
 

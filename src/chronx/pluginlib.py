@@ -22,8 +22,9 @@ from .config import Config, Paths
 from .diffview import render_delta, stat_line
 from .ipc import encode_sync as _encode_sync
 from .ipc import send_line as _send_line
+from .config import load_root_ignore
 from .ops import OpsError, branch_state_at, describe_command, state_at
-from .snapshot import working_changes
+from .snapshot import is_ignored_rel, working_changes
 from .store import ObjectStore, hash_bytes
 from .when import WhenParseError, fmt_ts, parse_when
 
@@ -31,6 +32,7 @@ __all__ = [
     "click", "sqlite3", "Path", "dbm", "Config", "Paths", "ObjectStore",
     "hash_bytes", "render_delta", "stat_line", "describe_command", "OpsError",
     "branch_state_at", "state_at", "fmt_ts", "working_changes",
+    "is_ignored_rel", "load_root_ignore",
     "paths", "open_db", "human_bytes", "parse_at", "moment_ts",
     "require_daemon_stopped", "root_for_cwd", "active_branch_id",
     "current_file_state", "write_atomic", "send_sync",

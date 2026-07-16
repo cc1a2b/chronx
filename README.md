@@ -99,6 +99,17 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx cast -o <f.html>` | Self-contained, shareable HTML replay of a session. |
 | `chronx dump` | Export history as JSON for `jq` / external tooling. |
 | `chronx reflog` | Log of chronx's own operations = recovery points. |
+| `chronx ls [ref]` | List files as they were at any moment (`-l`, `--tree`). |
+| `chronx diff-tree <a> <b>` | Structural diff between any two moments or branch tips. |
+| `chronx since <moment>` | Net cumulative diff since a moment + the commands responsible. |
+| `chronx open <file> [when] --vs <o>` | View/diff a file's historical versions in your pager. |
+| `chronx sql [query]` | Read-only SQL console over the store. |
+| `chronx churn --by …` | Line-churn report by session/day/command/extension. |
+| `chronx timings` | Wall-clock duration analytics — slowest commands, time by command. |
+| `chronx failures` | Failed-command analysis: exit codes, worst offenders, time-to-fix. |
+| `chronx note add/list` | Attach freeform notes to events (sidecar; history stays pristine). |
+| `chronx monitor` | Live dashboard tailing recording in real time. |
+| `chronx verify-store` | Deep integrity + referential-consistency audit (beyond fsck). |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |
