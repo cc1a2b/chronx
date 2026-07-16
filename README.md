@@ -110,6 +110,14 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx note add/list` | Attach freeform notes to events (sidecar; history stays pristine). |
 | `chronx monitor` | Live dashboard tailing recording in real time. |
 | `chronx verify-store` | Deep integrity + referential-consistency audit (beyond fsck). |
+| `chronx redo` | Re-apply the change most recently reverted by `undo`. |
+| `chronx conflicts <other>` | Predict merge conflicts before merging (read-only dry-run). |
+| `chronx when <file> <pat>` | Pinpoint the command where a file first matched a regex. |
+| `chronx blame-stats <file>` | Aggregate line ownership — who wrote how much of a file. |
+| `chronx loc` / `chronx sizes <f>` | Lines-of-code growth / one file's size evolution over time. |
+| `chronx script` | Reconstruct a runnable shell script from a recorded session. |
+| `chronx graphviz` | Export the timeline graph as Graphviz DOT (`\| dot -Tsvg`). |
+| `chronx gen-docs` / `chronx completion` | Generate the Markdown command reference / shell completions. |
 | `chronx mark <name>` / `chronx marks` | Name the current moment; use the name anywhere a time is accepted. |
 | `chronx search <pat>` | Grep command history; `-S <regex>` finds which command added/removed a line. |
 | `chronx tail` | Follow the event stream live (`--stat` for file lists) — `tail -f` for your workflow. |

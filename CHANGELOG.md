@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.6 — 2026-07-16
+
+### Added — 10 more commands (plugins)
+- **`chronx completion bash|zsh|fish`** — emit a native shell tab-completion
+  script for chronx's now-90+ commands.
+- **`chronx gen-docs`** — generate a full Markdown command reference from the
+  live CLI (TOC, nested subcommands, per-command option tables).
+- **`chronx graphviz`** — export the timeline/branch graph as Graphviz DOT
+  (`chronx graphviz | dot -Tsvg`), with per-branch clusters and fork edges.
+- **`chronx loc`** — total lines-of-code growth over the session (sparkline,
+  `--by-ext` breakdown).
+- **`chronx sizes <file>`** — one file's size evolution as a bar chart.
+- **`chronx when <file> <pattern>`** — pinpoint the command where a file first
+  started (or, `--gone`, stopped) matching a regex.
+- **`chronx conflicts <other>`** — predict merge conflicts before merging (a
+  read-only dry-run of `chronx merge`); exits non-zero when conflicts exist.
+- **`chronx script`** — reconstruct a runnable, commented shell script from a
+  recorded session (`--session`, `--since`, `--changed-only`, `--skip-failed`).
+- **`chronx blame-stats <file>`** — aggregate line ownership: which command
+  wrote how much of a file, ranked with percentages.
+- **`chronx redo`** — re-apply the change most recently reverted by `undo`
+  (reuses the undo safety net; itself reversible).
+
 ## 0.2.5 — 2026-07-16
 
 ### Added — 11 more commands (plugins)
