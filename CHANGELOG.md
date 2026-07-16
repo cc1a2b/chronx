@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.7 — 2026-07-16
+
+### Added — 10 more commands (plugins)
+- **`chronx from-git <repo>`** — import a git repository's history into chronx
+  (one commit → one event), the inverse of `to-git`. Routes through the
+  verified import path, so `from-git` then `to-git` round-trips.
+- **`chronx apply <patch>`** — apply an external unified-diff patch to the tree
+  and record it as one reversible event (companion to `format-patch`).
+- **`chronx cat-file <ref>`** — low-level store inspector: dump a blob by digest,
+  or a `<moment>:<path>` ref, like `git cat-file` (`-t`, `-s`, `--check`).
+- **`chronx risky`** — safety audit of your command history (rm -rf, force-push,
+  dd, pipe-to-shell, …), correlated with what actually got deleted.
+- **`chronx focus`** — cluster commands into focused work-blocks by idle gaps.
+- **`chronx heat <file>`** — per-line change-frequency map (which lines churn).
+- **`chronx suggest`** — a shell coach: aliasable commands, undo-prone patterns,
+  repeated failures, likely typos, uncheckpointed streaks.
+- **`chronx impact <file>`** — one-file co-change: "when I change X, what else?".
+- **`chronx wrapped`** — a curated "your session, wrapped" highlight reel.
+- **`chronx mermaid`** — export the timeline as a GitHub-native Mermaid diagram
+  (`gitGraph` / `flowchart`, `--fence` for pasting into Markdown).
+
 ## 0.2.6 — 2026-07-16
 
 ### Added — 10 more commands (plugins)

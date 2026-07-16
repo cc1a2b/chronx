@@ -127,6 +127,16 @@ if the daemon isn't running it does nothing, and it never slows your prompt.
 | `chronx export` / `import` | Move recorded history between machines; `import <a> --as .` re-attaches it here. |
 | `chronx serve` + `chronx pull <url>` | Pull a teammate's recorded session over HTTP (idempotent, incremental). |
 | `chronx to-git <dir>` | Replay your session into a real git repo — one commit per command. |
+| `chronx from-git <repo>` | Import a git repo's history into chronx (inverse of `to-git`). |
+| `chronx apply <patch>` | Apply an external diff patch and record it (reversible). |
+| `chronx cat-file <ref>` | Dump a blob by digest or `<moment>:<path>` (like `git cat-file`). |
+| `chronx risky` | Safety audit of your command history (rm -rf, force-push, …). |
+| `chronx suggest` | Shell coach: aliasable commands, undo-prone patterns, typos. |
+| `chronx impact <file>` | One-file co-change: when I change X, what else changes? |
+| `chronx heat <file>` | Per-line change-frequency map (which lines churn most). |
+| `chronx focus` | Cluster commands into focused work-blocks by idle gaps. |
+| `chronx wrapped` | A "your session, wrapped" highlight reel. |
+| `chronx mermaid` | Timeline as a GitHub-native Mermaid diagram (renders in Markdown). |
 | `chronx stats` | Hottest files, noisiest commands, store size. |
 | `chronx doctor` | Diagnose the pipeline: store, db, daemon, fifo, hooks, disk. |
 | `chronx roots` | List tracked directories; `roots forget <path>` erases one's history. |
