@@ -130,8 +130,10 @@ jobs:
           name: ${{ env.DIST_ARTIFACT }}
           path: dist
 
+      # Docker action: it pulls ghcr.io/pypa/gh-action-pypi-publish:<this ref>,
+      # so the ref must be the commit SHA, not the v1.14.2 annotated tag object.
       - name: Publish to PyPI via trusted publishing
-        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist
           print-hash: true
