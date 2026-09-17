@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.8 — 2026-09-17
+
+First release published to PyPI, so `pipx install chronx` now works from a
+plain index rather than a checkout. No command or behaviour changes.
+
+### Changed
+- Releases are built and uploaded by GitHub Actions using PyPI trusted
+  publishing (OIDC), with no API token stored anywhere. A tag push builds the
+  sdist and wheel, checks the metadata, installs the wheel on Python 3.11,
+  3.12 and 3.13, and only then publishes.
+- The version is now read from `src/chronx/__init__.py` alone. It used to be
+  written out in `pyproject.toml` as well, which meant the two could drift and
+  a tag could ship a package claiming a different version; the release workflow
+  now refuses to publish when the built artifacts disagree with the tag.
+- License metadata uses the PEP 639 SPDX form (`license = "MIT"` plus
+  `license-files`) instead of the deprecated `License ::` classifier, which
+  PyPI no longer accepts for new projects.
+- Added Changelog and Issues links to the PyPI project sidebar.
+
 ## 0.2.7 — 2026-07-16
 
 ### Added — 10 more commands (plugins)
